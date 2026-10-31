@@ -17,8 +17,9 @@
   <img src="https://img.shields.io/badge/ngrok-supported-1F1E37?logo=ngrok" alt="ngrok">
   <img src="https://img.shields.io/badge/setup-automatic-22C55E" alt="Automatic setup">
 </p>
-
-<img width="1024" height="1536" alt="image" src="https://github.com/user-attachments/assets/31da1272-a98a-4685-bb5e-88a42e811b70" />
+<p align="center">
+  <img width="700" alt="image" src="https://github.com/user-attachments/assets/31da1272-a98a-4685-bb5e-88a42e811b70" />
+</p>
 
 
 ---
@@ -898,5 +899,5 @@ https://dashboard.ngrok.com/get-started/your-authtoken
 
 <p align="center">
   <strong>DevSpace MCP Launcher for Windows</strong><br>
-  Install → Configure → Connect → Code
+  Лаунчер написан ИИ. У меня работает. Если что сообщайте об ошибках в проблемах в этом репозитории.
 </p>
