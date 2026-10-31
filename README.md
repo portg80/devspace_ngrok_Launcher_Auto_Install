@@ -1,10 +1,11 @@
 <p align="center">
-  <img src="docs/images/devspace-mcp-launcher-banner.png" alt="DevSpace MCP Launcher for Windows">
+  <img width="2172" height="724" alt="DevSpace MCP Launcher for Windows" src="https://github.com/user-attachments/assets/47524226-14bc-4262-9602-ca02f0a5e9ea" />
 </p>
 
 <h1 align="center">DevSpace MCP Launcher for Windows</h1>
 
 <p align="center">
+  Об
   Автоматическая установка, настройка и безопасный запуск DevSpace MCP + ngrok для ChatGPT на Windows.
 </p>
 
