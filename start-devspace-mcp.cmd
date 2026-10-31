@@ -1,4 +1,4 @@
-﻿@echo off
+@echo off
 setlocal EnableExtensions
 chcp 65001 >nul 2>&1
 set "DEVSPACE_BOOTSTRAP_FILE=%~f0"
@@ -43,7 +43,15 @@ $MinNgrok   = [Version]'3.20.0'
 $SettingsPath = Join-Path $ScriptDir 'devspace-mcp-settings.json'
 $LegacyDomainPath = Join-Path $ScriptDir 'dev-domain.txt'
 $LogDir = Join-Path $ScriptDir 'logs'
-$ScriptVersion = '1.3.3'
+$RuntimeDir = Join-Path $env:LOCALAPPDATA 'DevSpaceMCPLauncher'
+try {
+    New-Item -ItemType Directory -Path $RuntimeDir -Force -ErrorAction Stop | Out-Null
+} catch {
+    $RuntimeDir = Join-Path $env:TEMP 'DevSpaceMCPLauncher'
+    New-Item -ItemType Directory -Path $RuntimeDir -Force | Out-Null
+}
+$RuntimeStatePath = Join-Path $RuntimeDir 'runtime.json'
+$ScriptVersion = '1.3.9'
 
 try { [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false) } catch {}
 try { [Console]::InputEncoding  = New-Object Text.UTF8Encoding($false) } catch {}
@@ -99,6 +107,7 @@ $script:CurrentStep = 0
 $script:GitBash = $null
 $script:GitMintty = $null
 $script:NgrokExe = $null
+$script:NgrokConfigPathHint = $null
 $script:NgrokProcess = $null
 $script:NgrokStdOut = $null
 $script:NgrokStdErr = $null
@@ -106,6 +115,9 @@ $script:NgrokFailureLogsShown = $false
 $script:DevSpaceProcess = $null
 $script:DevSpaceStdOut = $null
 $script:DevSpaceStdErr = $null
+$script:DevSpaceWatchdogProcess = $null
+$script:DevSpaceWatchdogStopFile = $null
+$script:DevSpaceJobProtected = $false
 
 # -----------------------------------------------------------------------------
 # Process lifetime guard
@@ -300,6 +312,454 @@ function Register-ManagedPid {
     }
 }
 
+
+function Try-RegisterManagedProcess {
+    param(
+        [Parameter(Mandatory=$true)]$Process,
+        [Parameter(Mandatory=$true)][string]$Name
+    )
+
+    if (-not $Process) { return $false }
+
+    try {
+        $ok = [DevSpaceMcp.ProcessGuard]::Assign([int]$Process.Id)
+        if ($ok) { return $true }
+    } catch {}
+
+    Write-Warn ("Процесс '{0}' (PID {1}) уже может принадлежать другому Windows Job Object. " +
+        "Привязка к внутреннему Job Object пропущена; безопасность обеспечит watchdog." -f $Name, $Process.Id)
+    return $false
+}
+
+function Try-RegisterManagedPid {
+    param(
+        [Parameter(Mandatory=$true)][int]$ProcessId,
+        [Parameter(Mandatory=$true)][string]$Name
+    )
+
+    try {
+        $ok = [DevSpaceMcp.ProcessGuard]::Assign($ProcessId)
+        if ($ok) { return $true }
+    } catch {}
+
+    Write-Warn ("Процесс '{0}' (PID {1}) не удалось дополнительно привязать к Windows Job Object. " +
+        "Watchdog продолжит контролировать завершение DevSpace." -f $Name, $ProcessId)
+    return $false
+}
+
+function Start-DevSpaceWatchdog {
+    param([Parameter(Mandatory=$true)][int]$DevSpaceLauncherPid)
+
+    Stop-DevSpaceWatchdog
+
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
+    $script:DevSpaceWatchdogStopFile = Join-Path $LogDir ("devspace-watchdog-{0}-{1}.stop" -f $PID, $stamp)
+    try { Remove-Item -LiteralPath $script:DevSpaceWatchdogStopFile -Force -ErrorAction SilentlyContinue } catch {}
+
+    $parentStartTicks = 0L
+    try {
+        $parentStartTicks = (Get-Process -Id $PID -ErrorAction Stop).StartTime.ToFileTimeUtc()
+    } catch {
+        throw "Не удалось определить время запуска процесса launcher для watchdog: $($_.Exception.Message)"
+    }
+
+    $watchdogScript = @"
+`$parentPid = $PID
+`$parentStartTicks = $parentStartTicks
+`$devSpaceLauncherPid = $DevSpaceLauncherPid
+`$port = $Port
+`$stopFile = '$($script:DevSpaceWatchdogStopFile.Replace("'","''"))'
+
+function Test-LauncherAlive {
+    try {
+        `$p = Get-Process -Id `$parentPid -ErrorAction Stop
+        return (`$p.StartTime.ToFileTimeUtc() -eq `$parentStartTicks)
+    } catch {
+        return `$false
+    }
+}
+
+while (`$true) {
+    if (Test-Path -LiteralPath `$stopFile) { exit 0 }
+    if (-not (Test-LauncherAlive)) { break }
+    Start-Sleep -Milliseconds 350
+}
+
+if (Test-Path -LiteralPath `$stopFile) { exit 0 }
+
+# The launcher disappeared unexpectedly: revoke MCP access.
+try {
+    & "`$env:SystemRoot\System32\taskkill.exe" /PID `$devSpaceLauncherPid /T /F *> `$null
+} catch {}
+
+Start-Sleep -Milliseconds 250
+
+# Defensive fallback in case Node detached from the Bash process tree.
+try {
+    `$listeners = Get-NetTCPConnection -LocalPort `$port -State Listen -ErrorAction SilentlyContinue
+    foreach (`$listener in @(`$listeners)) {
+        `$ownerPid = [int]`$listener.OwningProcess
+        if (`$ownerPid -gt 0 -and `$ownerPid -ne `$PID) {
+            try { Stop-Process -Id `$ownerPid -Force -ErrorAction SilentlyContinue } catch {}
+        }
+    }
+} catch {}
+
+exit 0
+"@
+
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($watchdogScript))
+    $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+
+    try {
+        $script:DevSpaceWatchdogProcess = Start-Process `
+            -FilePath $psExe `
+            -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-EncodedCommand',$encoded) `
+            -PassThru `
+            -WindowStyle Hidden
+
+        Start-Sleep -Milliseconds 120
+        if ($script:DevSpaceWatchdogProcess.HasExited) {
+            throw "watchdog завершился сразу после запуска с кодом $($script:DevSpaceWatchdogProcess.ExitCode)"
+        }
+
+        Write-Info ("Watchdog защиты DevSpace запущен (PID {0})." -f $script:DevSpaceWatchdogProcess.Id)
+        Save-RuntimeState
+        return $true
+    } catch {
+        $script:DevSpaceWatchdogProcess = $null
+        Write-Warn "Не удалось запустить watchdog DevSpace: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Stop-DevSpaceWatchdog {
+    $watchdog = $script:DevSpaceWatchdogProcess
+    $stopFile = $script:DevSpaceWatchdogStopFile
+
+    if ($stopFile) {
+        try {
+            [IO.File]::WriteAllText($stopFile, 'stop', (New-Object Text.UTF8Encoding($false)))
+        } catch {}
+    }
+
+    if ($watchdog) {
+        try {
+            if (-not $watchdog.HasExited) {
+                try { [void]$watchdog.WaitForExit(1200) } catch {}
+                if (-not $watchdog.HasExited) {
+                    try { $watchdog.Kill() } catch {}
+                }
+            }
+        } catch {}
+    }
+
+    if ($stopFile) {
+        try { Remove-Item -LiteralPath $stopFile -Force -ErrorAction SilentlyContinue } catch {}
+    }
+
+    $script:DevSpaceWatchdogProcess = $null
+    $script:DevSpaceWatchdogStopFile = $null
+    Save-RuntimeState
+}
+
+
+function Stop-ProcessTreeTargeted {
+    param(
+        [Parameter(Mandatory=$true)][int]$ProcessId,
+        [string]$Label = 'процесс',
+        $ExpectedStartTicks = $null,
+        [switch]$Quiet
+    )
+
+    if ($ProcessId -le 0 -or $ProcessId -eq $PID) { return $false }
+
+    $proc = $null
+    try { $proc = Get-Process -Id $ProcessId -ErrorAction Stop } catch { return $false }
+
+    if ($null -ne $ExpectedStartTicks) {
+        try {
+            $actual = [long]$proc.StartTime.ToFileTimeUtc()
+            if ($actual -ne [long]$ExpectedStartTicks) {
+                if (-not $Quiet) {
+                    Write-Info ("PID {0} из старого runtime-state уже принадлежит другому процессу; пропускаю." -f $ProcessId)
+                }
+                return $false
+            }
+        } catch {
+            return $false
+        }
+    }
+
+    if (-not $Quiet) {
+        Write-Info ("Останавливаю остаточный {0} (PID {1})..." -f $Label, $ProcessId)
+    }
+
+    try {
+        $taskkill = Join-Path $env:SystemRoot 'System32\taskkill.exe'
+        [void](Start-Process -FilePath $taskkill -ArgumentList @('/PID',[string]$ProcessId,'/T','/F') -PassThru -Wait -WindowStyle Hidden)
+    } catch {
+        try { Stop-Process -Id $ProcessId -Force -ErrorAction Stop } catch { return $false }
+    }
+
+    for ($i = 0; $i -lt 20; $i++) {
+        if (-not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) {
+            if (-not $Quiet) { Write-Ok ("{0} остановлен." -f $Label) }
+            return $true
+        }
+        Start-Sleep -Milliseconds 100
+    }
+
+    if (-not $Quiet) {
+        Write-Warn ("Не удалось подтвердить завершение {0} (PID {1})." -f $Label, $ProcessId)
+    }
+    return $false
+}
+
+function Get-RuntimeProcessRecord {
+    param($Process)
+
+    if (-not $Process) { return $null }
+    try {
+        if ($Process.HasExited) { return $null }
+        return [ordered]@{
+            pid = [int]$Process.Id
+            startTicks = [long]$Process.StartTime.ToFileTimeUtc()
+        }
+    } catch {
+        return $null
+    }
+}
+
+function Save-RuntimeState {
+    try {
+        $launcher = Get-Process -Id $PID -ErrorAction Stop
+        $state = [ordered]@{
+            schema = 1
+            launcher = [ordered]@{
+                pid = [int]$PID
+                startTicks = [long]$launcher.StartTime.ToFileTimeUtc()
+            }
+            port = [int]$Port
+            devspace = Get-RuntimeProcessRecord -Process $script:DevSpaceProcess
+            ngrok = Get-RuntimeProcessRecord -Process $script:NgrokProcess
+            watchdog = Get-RuntimeProcessRecord -Process $script:DevSpaceWatchdogProcess
+            updatedAt = [DateTime]::UtcNow.ToString('o')
+        }
+
+        $json = $state | ConvertTo-Json -Depth 8
+        [IO.File]::WriteAllText($RuntimeStatePath, $json, (New-Object Text.UTF8Encoding($false)))
+    } catch {
+        # Runtime-state is a recovery aid, not a reason to stop a working MCP.
+        Write-Warn "Не удалось обновить runtime-state launcher: $($_.Exception.Message)"
+    }
+}
+
+function Clear-RuntimeState {
+    try { Remove-Item -LiteralPath $RuntimeStatePath -Force -ErrorAction SilentlyContinue } catch {}
+}
+
+function Stop-StaleProcessesFromRuntimeState {
+    if (-not (Test-Path -LiteralPath $RuntimeStatePath -PathType Leaf)) { return 0 }
+
+    try {
+        $state = Get-Content -LiteralPath $RuntimeStatePath -Raw -ErrorAction Stop |
+            ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        Write-Warn 'Старый runtime-state повреждён; удаляю его и продолжаю сигнатурную проверку.'
+        Clear-RuntimeState
+        return 0
+    }
+
+    $stopped = 0
+    foreach ($spec in @(
+        [pscustomobject]@{ Property='watchdog'; Label='старый watchdog DevSpace' },
+        [pscustomobject]@{ Property='devspace'; Label='старый DevSpace MCP' },
+        [pscustomobject]@{ Property='ngrok'; Label='старый ngrok MCP' }
+    )) {
+        $property = $state.PSObject.Properties[$spec.Property]
+        if (-not $property -or $null -eq $property.Value) { continue }
+
+        $data = $property.Value
+        $pidProp = $data.PSObject.Properties['pid']
+        $ticksProp = $data.PSObject.Properties['startTicks']
+        if (-not $pidProp) { continue }
+
+        $pidValue = 0
+        try { $pidValue = [int]$pidProp.Value } catch { continue }
+
+        $ticksValue = $null
+        if ($ticksProp) {
+            try { $ticksValue = [long]$ticksProp.Value } catch { $ticksValue = $null }
+        }
+
+        if ($pidValue -gt 0) {
+            if (Stop-ProcessTreeTargeted -ProcessId $pidValue -Label $spec.Label -ExpectedStartTicks $ticksValue) {
+                $stopped++
+            }
+        }
+    }
+
+    Clear-RuntimeState
+    return $stopped
+}
+
+function Test-IsDevSpaceServerProcess {
+    param($CimProcess)
+
+    if (-not $CimProcess) { return $false }
+
+    $name = [string]$CimProcess.Name
+    $cmd = [string]$CimProcess.CommandLine
+    if ([string]::IsNullOrWhiteSpace($cmd)) { return $false }
+
+    if ($cmd -match '(?i)@waishnav[\\/]+devspace') { return $true }
+    if ($cmd -match '(?i)\bdevspace\b.*\bserve\b') { return $true }
+    if ($name -match '(?i)^node\.exe$' -and $cmd -match '(?i)\bdevspace\b') { return $true }
+
+    return $false
+}
+
+function Get-EncodedPowerShellPayload {
+    param([string]$CommandLine)
+
+    if ([string]::IsNullOrWhiteSpace($CommandLine)) { return $null }
+
+    $m = [regex]::Match(
+        $CommandLine,
+        '(?i)(?:-EncodedCommand|-enc)\s+(?:"(?<b64>[A-Za-z0-9+/=]+)"|(?<b64>[A-Za-z0-9+/=]+))'
+    )
+    if (-not $m.Success) { return $null }
+
+    try {
+        $bytes = [Convert]::FromBase64String($m.Groups['b64'].Value)
+        return [Text.Encoding]::Unicode.GetString($bytes)
+    } catch {
+        return $null
+    }
+}
+
+function Stop-StaleLauncherWatchdogs {
+    $stopped = 0
+    try {
+        $procs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Name -match '(?i)^(powershell|pwsh)\.exe$' -and
+                [int]$_.ProcessId -ne $PID
+            }
+
+        foreach ($p in @($procs)) {
+            $payload = Get-EncodedPowerShellPayload -CommandLine ([string]$p.CommandLine)
+            if (-not $payload) { continue }
+
+            if (($payload -match '\$devSpaceLauncherPid') -and
+                ($payload -match 'Test-LauncherAlive') -and
+                ($payload -match ('\$port\s*=\s*' + [regex]::Escape([string]$Port)))) {
+                if (Stop-ProcessTreeTargeted -ProcessId ([int]$p.ProcessId) -Label 'старый watchdog DevSpace') {
+                    $stopped++
+                }
+            }
+        }
+    } catch {
+        Write-Warn "Не удалось проверить старые watchdog-процессы: $($_.Exception.Message)"
+    }
+    return $stopped
+}
+
+function Stop-StaleDevSpaceListener {
+    $stopped = 0
+    try {
+        $listeners = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
+        foreach ($listener in $listeners) {
+            $ownerPid = [int]$listener.OwningProcess
+            if ($ownerPid -le 0 -or $ownerPid -eq $PID) { continue }
+
+            $cim = Get-CimInstance Win32_Process -Filter "ProcessId=$ownerPid" -ErrorAction SilentlyContinue
+            if (Test-IsDevSpaceServerProcess -CimProcess $cim) {
+                if (Stop-ProcessTreeTargeted -ProcessId $ownerPid -Label ("старый DevSpace на порту {0}" -f $Port)) {
+                    $stopped++
+                }
+            } else {
+                $name = if ($cim) { [string]$cim.Name } else { 'неизвестный процесс' }
+                Write-Warn ("Порт {0} уже занят процессом {1} (PID {2}), но он не похож на DevSpace. Автоматически его не завершаю." -f $Port, $name, $ownerPid)
+            }
+        }
+    } catch {
+        Write-Warn "Не удалось выполнить предстартовую проверку порта ${Port}: $($_.Exception.Message)"
+    }
+    return $stopped
+}
+
+function Stop-StaleNgrokForDevSpace {
+    $stopped = 0
+
+    try {
+        $ngrokProcesses = @(Get-CimInstance Win32_Process -Filter "Name='ngrok.exe'" -ErrorAction SilentlyContinue)
+    } catch {
+        $ngrokProcesses = @()
+    }
+
+    foreach ($p in $ngrokProcesses) {
+        $cmd = [string]$p.CommandLine
+        if ([string]::IsNullOrWhiteSpace($cmd)) { continue }
+
+        $targetsPort = (
+            ($cmd -match ('(?i)\bhttp\b.*(?:\s|=)' + [regex]::Escape([string]$Port) + '(?:\s|$)')) -or
+            ($cmd -match ('(?i)(?:\s|=)' + [regex]::Escape([string]$Port) + '(?:\s|$).*\bhttp\b'))
+        )
+
+        if ($targetsPort) {
+            if (Stop-ProcessTreeTargeted -ProcessId ([int]$p.ProcessId) -Label 'старый ngrok-туннель DevSpace') {
+                $stopped++
+            }
+        }
+    }
+
+    # MSIX can occasionally hide/normalize CommandLine. If Inspector confirms
+    # that its only running tunnel forwards to our MCP port and there is exactly
+    # one ngrok.exe, identify that process as ours.
+    if ($stopped -eq 0 -and @($ngrokProcesses).Count -eq 1) {
+        try {
+            $tunnels = Invoke-RestMethod -Uri 'http://127.0.0.1:4040/api/tunnels' -TimeoutSec 1 -ErrorAction Stop
+            $ours = @($tunnels.tunnels | Where-Object {
+                $addr = [string]$_.config.addr
+                $addr -match ('(?i)(?:^|:)' + [regex]::Escape([string]$Port) + '$')
+            })
+
+            if ($ours.Count -gt 0) {
+                if (Stop-ProcessTreeTargeted -ProcessId ([int]$ngrokProcesses[0].ProcessId) -Label 'старый ngrok-туннель DevSpace') {
+                    $stopped++
+                }
+            }
+        } catch {}
+    }
+
+    return $stopped
+}
+
+function Invoke-StartupProcessCleanup {
+    Write-Rule 'ПРЕДСТАРТОВАЯ ПРОВЕРКА ОСТАТОЧНЫХ ПРОЦЕССОВ'
+
+    $total = 0
+    $total += Stop-StaleProcessesFromRuntimeState
+    $total += Stop-StaleLauncherWatchdogs
+    $total += Stop-StaleDevSpaceListener
+    $total += Stop-StaleNgrokForDevSpace
+
+    Start-Sleep -Milliseconds 500
+
+    try {
+        Get-ChildItem -LiteralPath $LogDir -Filter 'devspace-watchdog-*.stop' -File -ErrorAction SilentlyContinue |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+    } catch {}
+
+    if ($total -gt 0) {
+        Write-Ok ("Предыдущий запуск очищен. Завершено остаточных процессов: {0}." -f $total)
+    } else {
+        Write-Ok 'Остаточные процессы предыдущего запуска не найдены.'
+    }
+}
+
 function Start-Log {
     param([switch]$Append)
     if ($script:TranscriptActive) { return }
@@ -316,6 +776,20 @@ function Stop-Log {
     if (-not $script:TranscriptActive) { return }
     try { Stop-Transcript | Out-Null } catch {}
     $script:TranscriptActive = $false
+}
+
+function Read-HostWithoutTranscript {
+    param([Parameter(Mandatory=$true)][string]$Prompt)
+
+    # Keep the user's input visible in the console, but do not persist secrets
+    # such as the ngrok Authtoken into Start-Transcript logs.
+    $resumeTranscript = $script:TranscriptActive
+    if ($resumeTranscript) { Stop-Log }
+    try {
+        return (Read-Host $Prompt)
+    } finally {
+        if ($resumeTranscript) { Start-Log -Append }
+    }
 }
 
 function Write-Rule {
@@ -385,7 +859,7 @@ function Write-AccessWarningBox {
     if ($titleText.Length -gt $width) { $titleText = $titleText.Substring(0, $width) }
     Write-Host ('|' + $titleText + '|') -ForegroundColor Red
     Write-Host ('+' + ('-' * $width) + '+') -ForegroundColor Red
-    if (-not $Roots -or $Roots.Count -eq 0) {
+    if (-not $Roots -or @($Roots).Count -eq 0) {
         $Roots = @('НЕ НАСТРОЕНО — сервер не должен работать в таком состоянии.')
     }
     foreach ($root in $Roots) {
@@ -1162,46 +1636,290 @@ function Ensure-Ngrok {
     return $ng
 }
 
-function Get-NgrokConfigPath {
-    if (-not $script:NgrokExe) { return $null }
-    $r = Invoke-Native -FilePath $script:NgrokExe -Arguments @('config','check') -AllowFailure -Quiet
-    foreach ($line in ($r.Output -split "`r?`n")) {
-        if ($line -match '(?<path>[A-Za-z]:\\[^\r\n]*?\.ya?ml)') {
-            $p = $Matches['path'].Trim('"','''',' ')
-            if (Test-Path -LiteralPath $p) { return $p }
-        }
+function Get-NgrokConfigCheckInfo {
+    $result = [ordered]@{
+        ExitCode = -1
+        Output   = ''
+        Path     = $null
     }
-    $candidates = @(
+
+    if (-not $script:NgrokExe) {
+        return [pscustomobject]$result
+    }
+
+    try {
+        $r = Invoke-Native -FilePath $script:NgrokExe -Arguments @('config','check') -AllowFailure -Quiet
+        $result.ExitCode = $r.ExitCode
+        $result.Output = [string]$r.Output
+
+        foreach ($line in ($r.Output -split '\r?\n')) {
+            # Strip ANSI escape sequences before parsing a Windows path.
+            $clean = [regex]::Replace([string]$line, "$([char]27)\[[0-9;?]*[ -/]*[@-~]", '')
+            $m = [regex]::Match($clean, '(?i)(?<path>[A-Za-z]:\\.*?\.ya?ml)(?:"|''|\s|$)')
+            if ($m.Success) {
+                $candidate = $m.Groups['path'].Value.Trim()
+                if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                    $result.Path = (Resolve-Path -LiteralPath $candidate).Path
+                    break
+                }
+            }
+        }
+    } catch {
+        $result.Output = $_.Exception.Message
+    }
+
+    return [pscustomobject]$result
+}
+
+function Add-UniqueExistingPath {
+    param(
+        [Parameter(Mandatory=$true)]$List,
+        [string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+
+    try {
+        $clean = [Environment]::ExpandEnvironmentVariables(
+            $Path.Trim().Trim([char]34, [char]39, [char]32)
+        )
+        if (-not (Test-Path -LiteralPath $clean -PathType Leaf)) { return }
+
+        $resolved = (Resolve-Path -LiteralPath $clean).Path
+        foreach ($existing in $List) {
+            if ([string]::Equals([string]$existing, $resolved, [StringComparison]::OrdinalIgnoreCase)) {
+                return
+            }
+        }
+        [void]$List.Add($resolved)
+    } catch {}
+}
+
+function Get-NgrokConfigPaths {
+    $paths = New-Object 'System.Collections.Generic.List[string]'
+
+    # 1. Exact path learned during this launcher run.
+    Add-UniqueExistingPath -List $paths -Path $script:NgrokConfigPathHint
+
+    # 2. Explicit ngrok override.
+    Add-UniqueExistingPath -List $paths -Path $env:NGROK_CONFIG
+
+    # 3. Ask the active ngrok executable for the config it actually validates.
+    $check = Get-NgrokConfigCheckInfo
+    Add-UniqueExistingPath -List $paths -Path $check.Path
+
+    # 4. Official/default Windows locations for current and legacy ngrok.
+    $known = @(
         (Join-Path $env:LOCALAPPDATA 'ngrok\ngrok.yml'),
         (Join-Path $env:LOCALAPPDATA 'ngrok\ngrok.yaml'),
+        (Join-Path $env:USERPROFILE 'AppData\Local\ngrok\ngrok.yml'),
+        (Join-Path $env:USERPROFILE 'AppData\Local\ngrok\ngrok.yaml'),
         (Join-Path $env:USERPROFILE '.config\ngrok\ngrok.yml'),
-        (Join-Path $env:USERPROFILE '.config\ngrok\ngrok.yaml')
+        (Join-Path $env:USERPROFILE '.config\ngrok\ngrok.yaml'),
+        (Join-Path $env:USERPROFILE '.ngrok2\ngrok.yml'),
+        (Join-Path $env:USERPROFILE '.ngrok2\ngrok.yaml')
     )
-    foreach ($p in $candidates) { if (Test-Path -LiteralPath $p) { return $p } }
+    foreach ($p in $known) {
+        Add-UniqueExistingPath -List $paths -Path $p
+    }
+
+    # 5. MSIX packages may expose package-local state. Probe only package
+    # directories whose names contain "ngrok", not the whole Packages tree.
+    $packagesRoot = Join-Path $env:LOCALAPPDATA 'Packages'
+    if (Test-Path -LiteralPath $packagesRoot -PathType Container) {
+        try {
+            Get-ChildItem -LiteralPath $packagesRoot -Directory -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -match '(?i)ngrok' } |
+                ForEach-Object {
+                    try {
+                        Get-ChildItem -LiteralPath $_.FullName -File -Recurse -ErrorAction SilentlyContinue |
+                            Where-Object { $_.Name -match '(?i)^ngrok\.ya?ml$' } |
+                            ForEach-Object {
+                                Add-UniqueExistingPath -List $paths -Path $_.FullName
+                            }
+                    } catch {}
+                }
+        } catch {}
+    }
+
+    return @($paths.ToArray())
+}
+
+function Get-NgrokConfigPath {
+    $paths = @(Get-NgrokConfigPaths)
+    if ($paths.Count -gt 0) { return [string]$paths[0] }
+    return $null
+}
+
+function Read-TextFileAutoEncoding {
+    param([Parameter(Mandatory=$true)][string]$Path)
+
+    [byte[]]$bytes = [IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -eq 0) { return '' }
+
+    # BOM-aware decoding.
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        return [Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length - 3)
+    }
+    if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) {
+        return [Text.Encoding]::Unicode.GetString($bytes, 2, $bytes.Length - 2)
+    }
+    if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF) {
+        return [Text.Encoding]::BigEndianUnicode.GetString($bytes, 2, $bytes.Length - 2)
+    }
+
+    # Detect UTF-16 without BOM by the characteristic NUL-byte pattern.
+    $sampleLength = [Math]::Min($bytes.Length, 512)
+    $evenNulls = 0
+    $oddNulls = 0
+    for ($i = 0; $i -lt $sampleLength; $i++) {
+        if ($bytes[$i] -eq 0) {
+            if (($i % 2) -eq 0) { $evenNulls++ } else { $oddNulls++ }
+        }
+    }
+    if ($oddNulls -gt 4 -and $oddNulls -gt ($evenNulls * 2)) {
+        return [Text.Encoding]::Unicode.GetString($bytes)
+    }
+    if ($evenNulls -gt 4 -and $evenNulls -gt ($oddNulls * 2)) {
+        return [Text.Encoding]::BigEndianUnicode.GetString($bytes)
+    }
+
+    # ngrok itself writes UTF-8/ASCII on Windows.
+    try {
+        $strictUtf8 = New-Object Text.UTF8Encoding($false, $true)
+        return $strictUtf8.GetString($bytes)
+    } catch {
+        return [Text.Encoding]::Default.GetString($bytes)
+    }
+}
+
+function ConvertFrom-NgrokYamlScalar {
+    param([string]$Value)
+
+    if ($null -eq $Value) { return $null }
+    $v = $Value.Trim()
+    if (-not $v) { return $null }
+
+    if ($v.Length -ge 2 -and $v[0] -eq '"' -and $v[$v.Length - 1] -eq '"') {
+        return $v.Substring(1, $v.Length - 2)
+    }
+    if ($v.Length -ge 2 -and $v[0] -eq [char]39 -and $v[$v.Length - 1] -eq [char]39) {
+        return $v.Substring(1, $v.Length - 2)
+    }
+
+    # Remove a YAML comment only when separated from the value by whitespace.
+    $v = [regex]::Replace($v, '\s+#.*$', '').Trim()
+    if (-not $v) { return $null }
+
+    # Environment-variable references are valid YAML values too.
+    if ($v -match '^\$\{(?<name>[A-Za-z_][A-Za-z0-9_]*)\}$') {
+        $envValue = [Environment]::GetEnvironmentVariable($Matches['name'])
+        if (-not [string]::IsNullOrWhiteSpace($envValue)) { return $envValue }
+    }
+    if ($v -match '^\$(?<name>[A-Za-z_][A-Za-z0-9_]*)$') {
+        $envValue = [Environment]::GetEnvironmentVariable($Matches['name'])
+        if (-not [string]::IsNullOrWhiteSpace($envValue)) { return $envValue }
+    }
+
+    return $v
+}
+
+function Read-NgrokAuthtokenFromConfig {
+    param([Parameter(Mandatory=$true)][string]$Path)
+
+    try {
+        $text = Read-TextFileAutoEncoding -Path $Path
+    } catch {
+        return $null
+    }
+
+    # Normal ngrok v2:
+    #   authtoken: TOKEN
+    #
+    # Normal ngrok v3:
+    #   agent:
+    #       authtoken: TOKEN
+    #
+    # Parse line-by-line first so indentation and the surrounding section do
+    # not matter.
+    foreach ($line in ($text -split '\r?\n')) {
+        $m = [regex]::Match(
+            [string]$line,
+            '^\s*(?:agent\.)?authtoken\s*:\s*(?<value>.*?)\s*$',
+            [Text.RegularExpressions.RegexOptions]::IgnoreCase
+        )
+        if ($m.Success) {
+            $token = ConvertFrom-NgrokYamlScalar -Value $m.Groups['value'].Value
+            if (-not [string]::IsNullOrWhiteSpace($token)) {
+                return $token
+            }
+        }
+    }
+
+    # Defensive fallback for compact/inline YAML, for example:
+    # agent: { authtoken: TOKEN }
+    $inline = [regex]::Match(
+        $text,
+        '(?i)(?:^|[\{,]\s*)authtoken\s*:\s*(?<value>"[^"]*"|''[^'']*''|[^,\}\r\n]+)'
+    )
+    if ($inline.Success) {
+        $token = ConvertFrom-NgrokYamlScalar -Value $inline.Groups['value'].Value
+        if (-not [string]::IsNullOrWhiteSpace($token)) {
+            return $token
+        }
+    }
+
     return $null
 }
 
 function Get-NgrokAuthtokenValue {
-    $p = Get-NgrokConfigPath
-    if (-not $p) { return $null }
-    try {
-        $text = Get-Content -LiteralPath $p -Raw -ErrorAction Stop
-        $m = [regex]::Match($text, '(?m)^\s*authtoken\s*:\s*["'']?(?<token>[^\s"'']+)')
-        if ($m.Success) { return $m.Groups['token'].Value }
-    } catch {}
+    if (-not [string]::IsNullOrWhiteSpace($env:NGROK_AUTHTOKEN)) {
+        return [string]$env:NGROK_AUTHTOKEN
+    }
+
+    foreach ($p in @(Get-NgrokConfigPaths)) {
+        $token = Read-NgrokAuthtokenFromConfig -Path $p
+        if (-not [string]::IsNullOrWhiteSpace($token)) {
+            $script:NgrokConfigPathHint = $p
+            return $token
+        }
+    }
+
     return $null
 }
 
-function Test-NgrokAuthtokenConfigured {
-    # ngrok/MSIX may return from `config add-authtoken` a fraction before the
-    # config file is immediately visible to a second process. Retry briefly so
-    # a successful save is not reported as a false warning.
+function Test-NgrokConfigValid {
+    $check = Get-NgrokConfigCheckInfo
+    return ($check.ExitCode -eq 0)
+}
+
+function Get-NgrokAuthState {
     for ($i = 0; $i -lt 6; $i++) {
-        $value = Get-NgrokAuthtokenValue
-        if (-not [string]::IsNullOrWhiteSpace($value)) { return $true }
+        $token = Get-NgrokAuthtokenValue
+        if (-not [string]::IsNullOrWhiteSpace($token)) {
+            return [pscustomobject]@{
+                Configured  = $true
+                Token       = $token
+                Readable    = $true
+                ConfigValid = $true
+                ConfigPath  = $script:NgrokConfigPathHint
+            }
+        }
         if ($i -lt 5) { Start-Sleep -Milliseconds 200 }
     }
-    return $false
+
+    $check = Get-NgrokConfigCheckInfo
+    return [pscustomobject]@{
+        Configured  = $false
+        Token       = $null
+        Readable    = $false
+        ConfigValid = ($check.ExitCode -eq 0)
+        ConfigPath  = $check.Path
+    }
+}
+
+function Test-NgrokAuthtokenConfigured {
+    return [bool](Get-NgrokAuthState).Configured
 }
 
 function Get-MaskedSecret {
@@ -1213,30 +1931,41 @@ function Get-MaskedSecret {
 
 function Set-NgrokAuthtokenValue {
     param([Parameter(Mandatory=$true)][string]$Token)
+
     $plain = $Token.Trim()
     if ([string]::IsNullOrWhiteSpace($plain)) { throw 'Authtoken не введён.' }
-    $code = 1
+
     try {
-        & $script:NgrokExe config add-authtoken $plain 2>&1 | ForEach-Object { Write-Host $_.ToString() }
-        $code = $LASTEXITCODE
+        # Show ngrok's own result, but capture it as well so we can remember the
+        # exact configuration file it wrote.
+        $r = Invoke-Native -FilePath $script:NgrokExe -Arguments @('config','add-authtoken',$plain) -AllowFailure
     } finally {
         $plain = $null
     }
-    if ($code -ne 0) { throw "ngrok config add-authtoken завершился с кодом $code." }
 
-    $tokenVisible = Test-NgrokAuthtokenConfigured
-    $configCheck = Invoke-Native -FilePath $script:NgrokExe -Arguments @('config','check') -AllowFailure -Quiet
-
-    if ($tokenVisible) {
-        Write-Ok 'Authtoken сохранён в конфигурации ngrok.'
-    } elseif ($configCheck.ExitCode -eq 0) {
-        # The ngrok command itself succeeded and ngrok confirms the resulting
-        # config is valid. Do not show a scary false-negative warning merely
-        # because the immediate read-back raced with the MSIX config writer.
-        Write-Ok 'Authtoken сохранён. ngrok подтвердил корректность конфигурации.'
-    } else {
-        Write-Warn 'ngrok принял команду сохранения токена, но проверка конфигурации завершилась ошибкой. Реальная авторизация будет проверена при старте туннеля.'
+    if ($r.ExitCode -ne 0) {
+        throw "ngrok config add-authtoken завершился с кодом $($r.ExitCode)."
     }
+
+    foreach ($line in ($r.Output -split '\r?\n')) {
+        $clean = [regex]::Replace([string]$line, "$([char]27)\[[0-9;?]*[ -/]*[@-~]", '')
+        $m = [regex]::Match($clean, '(?i)(?<path>[A-Za-z]:\\.*?\.ya?ml)(?:"|''|\s|$)')
+        if ($m.Success) {
+            $candidate = $m.Groups['path'].Value.Trim()
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                $script:NgrokConfigPathHint = (Resolve-Path -LiteralPath $candidate).Path
+                break
+            }
+        }
+    }
+
+    $authState = Get-NgrokAuthState
+    if (-not $authState.Readable) {
+        $where = if ($authState.ConfigPath) { $authState.ConfigPath } else { '(путь не определён)' }
+        throw ("ngrok сообщил об успешном сохранении Authtoken, но launcher не смог прочитать ключ authtoken из активного файла конфигурации: {0}. Это внутренняя ошибка чтения конфигурации, запуск не будет молча продолжен." -f $where)
+    }
+
+    Write-Ok ('Authtoken сохранён: {0}' -f (Get-MaskedSecret $authState.Token))
 }
 
 function Set-NgrokAuthtokenInteractive {
@@ -1251,8 +1980,9 @@ function Set-NgrokAuthtokenInteractive {
 }
 
 function Ensure-NgrokAuthtoken {
-    if (Test-NgrokAuthtokenConfigured) {
-        Write-Ok ('Authtoken настроен: {0}' -f (Get-MaskedSecret (Get-NgrokAuthtokenValue)))
+    $authState = Get-NgrokAuthState
+    if ($authState.Readable) {
+        Write-Ok ('Authtoken настроен: {0}' -f (Get-MaskedSecret $authState.Token))
     } else {
         Set-NgrokAuthtokenInteractive
     }
@@ -1492,17 +2222,45 @@ function Set-DevSpaceAllowedRoots {
                 $updated = [regex]::Replace($content, $versionPattern, $insert, 1)
             }
         }
-        Set-Content -LiteralPath $configPath -Value $updated -Encoding UTF8
+        [IO.File]::WriteAllText($configPath, $updated, (New-Object Text.UTF8Encoding($false)))
     } else {
         $j = $content | ConvertFrom-Json
         if (-not $j.workspaces) { $j | Add-Member -NotePropertyName workspaces -NotePropertyValue ([pscustomobject]@{}) }
         $j.workspaces | Add-Member -NotePropertyName allowedRoots -NotePropertyValue @($Roots) -Force
-        $j | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $configPath -Encoding UTF8
+        $jsonText = $j | ConvertTo-Json -Depth 20`n        [IO.File]::WriteAllText($configPath, $jsonText, (New-Object Text.UTF8Encoding($false)))
     }
 
-    $check = Get-DevSpaceAllowedRoots
-    if ($check.Count -eq 0) { throw 'DevSpace не подтвердил сохранённые allowedRoots после изменения конфигурации.' }
-    Write-Ok ('Разрешённые папки DevSpace: {0}' -f ($check -join '; '))
+    try {
+        $check = @(Get-DevSpaceAllowedRoots)
+        if ($check.Count -eq 0) {
+            throw 'DevSpace не подтвердил сохранённые allowedRoots после изменения конфигурации.'
+        }
+
+        $expected = @($Roots | ForEach-Object { ([IO.Path]::GetFullPath([string]$_)).TrimEnd('\') })
+        $actual = @($check | ForEach-Object { ([IO.Path]::GetFullPath([string]$_)).TrimEnd('\') })
+        $expectedKey = (($expected | ForEach-Object { $_.ToLowerInvariant() } | Sort-Object) -join '|')
+        $actualKey = (($actual | ForEach-Object { $_.ToLowerInvariant() } | Sort-Object) -join '|')
+        if ($expectedKey -ne $actualKey) {
+            throw ("DevSpace вернул другой список allowedRoots после сохранения. Ожидалось: {0}; получено: {1}" -f ($expected -join '; '), ($actual -join '; '))
+        }
+
+        Write-Ok ('Разрешённые папки DevSpace: {0}' -f ($check -join '; '))
+    } catch {
+        # Never leave DevSpace with a broken/partially-written config. JSONC
+        # changes are made only after a backup has been created above.
+        if ($configPath.EndsWith('.jsonc', [StringComparison]::OrdinalIgnoreCase)) {
+            $backup = $configPath + '.launcher.bak'
+            if (Test-Path -LiteralPath $backup) {
+                try {
+                    Copy-Item -LiteralPath $backup -Destination $configPath -Force
+                    Write-Warn 'Изменение allowedRoots не прошло проверку. Предыдущая конфигурация автоматически восстановлена.'
+                } catch {
+                    Write-Warn "Не удалось автоматически восстановить backup конфигурации: $($_.Exception.Message)"
+                }
+            }
+        }
+        throw
+    }
 }
 
 function Select-AllowedRootsInteractive {
@@ -1822,26 +2580,39 @@ function Select-NgrokAuthtokenInteractive {
             'https://dashboard.ngrok.com/get-started/your-authtoken'
             'Скопируйте Authtoken и вставьте его ниже.'
         )
-        $saved = Get-NgrokAuthtokenValue
-        if ($saved) {
-            Write-SavedAccent ("Сохранённый токен: {0}" -f (Get-MaskedSecret $saved))
+
+        $authState = Get-NgrokAuthState
+        if ($authState.Readable) {
+            Write-SavedAccent ("Сохранённый токен: {0}" -f (Get-MaskedSecret $authState.Token))
             Write-SavedAccent 'Enter — оставить сохранённый токен.'
         } else {
-            Write-Host 'Authtoken ещё не настроен.' -ForegroundColor Yellow
+            Write-Host 'Authtoken ещё не настроен или не читается из конфигурации ngrok.' -ForegroundColor Yellow
+            if ($authState.ConfigPath) {
+                Write-Host ("Активный конфиг ngrok: {0}" -f $authState.ConfigPath) -ForegroundColor DarkGray
+            }
+            if ($authState.ConfigValid) {
+                Write-Warn 'ngrok считает конфигурацию синтаксически валидной, но ключ authtoken в ней не найден. Это НЕ считается сохранённым токеном.'
+            }
         }
-        Write-Host 'Введите новый токен, чтобы заменить сохранённый.' -ForegroundColor White
+
+        Write-Host 'Введите новый токен, чтобы заменить или настроить его.' -ForegroundColor White
         Write-Host 'B — назад в главное меню.' -ForegroundColor DarkGray
-        $raw = (Read-Host 'Authtoken').Trim()
+
+        $raw = (Read-HostWithoutTranscript -Prompt 'Authtoken').Trim()
         if ($raw -match '(?i)^(b|back|назад)$') { return $false }
+
         if (-not $raw) {
-            if ($saved) { return $true }
-            Write-Warn 'Сохранённого токена нет — вставьте Authtoken.'
+            if ($authState.Readable) { return $true }
+            Write-Warn 'Сохранённый Authtoken не найден — вставьте токен.'
             continue
         }
+
         try {
             Set-NgrokAuthtokenValue -Token $raw
             return $true
-        } catch { Write-Warn $_.Exception.Message }
+        } catch {
+            Write-Warn $_.Exception.Message
+        }
     }
 }
 
@@ -1917,6 +2688,7 @@ function Start-NgrokTunnel {
     try {
         $script:NgrokProcess = Start-Process -FilePath $script:NgrokExe -ArgumentList $args -PassThru -WindowStyle Hidden -RedirectStandardOutput $script:NgrokStdOut -RedirectStandardError $script:NgrokStdErr
         Register-ManagedProcess -Process $script:NgrokProcess -Name 'ngrok'
+        Save-RuntimeState
     } catch {
         $launchError = $_.Exception.ToString()
 
@@ -2117,9 +2889,8 @@ function Configure-LaunchWizard {
 }
 
 function Stop-DevSpaceServerBackground {
-    if (-not $script:DevSpaceProcess) { return }
     try {
-        if (-not $script:DevSpaceProcess.HasExited) {
+        if ($script:DevSpaceProcess -and -not $script:DevSpaceProcess.HasExited) {
             Write-Info 'Останавливаю DevSpace MCP server...'
             $pidToStop = [int]$script:DevSpaceProcess.Id
             try {
@@ -2127,17 +2898,35 @@ function Stop-DevSpaceServerBackground {
             } catch {
                 try { $script:DevSpaceProcess.Kill() } catch {}
             }
+
+            # If a Node process detached from Bash, terminate the listener owned
+            # by this MCP session as a final local cleanup.
             for ($i=0; $i -lt 20; $i++) {
                 Start-Sleep -Milliseconds 150
                 $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
                 if (-not $listener) { break }
+
+                if ($i -ge 10) {
+                    foreach ($entry in @($listener)) {
+                        $ownerPid = [int]$entry.OwningProcess
+                        if ($ownerPid -gt 0 -and $ownerPid -ne $PID) {
+                            try { Stop-Process -Id $ownerPid -Force -ErrorAction SilentlyContinue } catch {}
+                        }
+                    }
+                }
             }
+
             Write-Ok 'DevSpace MCP server остановлен.'
         }
     } catch {
         Write-Warn "Не удалось штатно остановить DevSpace server: $($_.Exception.Message)"
     } finally {
         $script:DevSpaceProcess = $null
+        $script:DevSpaceJobProtected = $false
+        Save-RuntimeState
+        # Stop watchdog only after the server tree has been cleaned up. If the
+        # launcher dies during cleanup, watchdog still revokes access.
+        Stop-DevSpaceWatchdog
     }
 }
 
@@ -2145,13 +2934,17 @@ function Stop-NgrokTunnelBackground {
     try {
         if ($script:NgrokProcess -and -not $script:NgrokProcess.HasExited) {
             $script:NgrokProcess.Kill()
-            try { $script:NgrokProcess.WaitForExit(3000) } catch {}
+            try { [void]$script:NgrokProcess.WaitForExit(3000) } catch {}
             Write-Ok 'ngrok остановлен.'
         }
     } catch {
         Write-Warn "Не удалось штатно остановить ngrok: $($_.Exception.Message)"
     } finally {
         $script:NgrokProcess = $null
+        Save-RuntimeState
+        if (-not $script:DevSpaceProcess -and -not $script:DevSpaceWatchdogProcess) {
+            Clear-RuntimeState
+        }
     }
 }
 
@@ -2177,12 +2970,32 @@ function Start-DevSpaceServerBackground {
     Write-Info 'Запускаю DevSpace MCP server в управляемом фоновом процессе.'
     $oldConv = $env:MSYS2_ARG_CONV_EXCL
     $env:MSYS2_ARG_CONV_EXCL = '*'
+
+    $watchdogReady = $false
     try {
         # Start-Process joins ArgumentList elements without preserving quotes around
         # a command containing spaces, therefore pass one explicitly quoted line.
         $argLine = '--login -c "' + $serverCommand.Replace('"','\"') + '"'
         $script:DevSpaceProcess = Start-Process -FilePath $script:GitBash -ArgumentList $argLine -PassThru -WindowStyle Hidden -RedirectStandardOutput $script:DevSpaceStdOut -RedirectStandardError $script:DevSpaceStdErr
-        Register-ManagedProcess -Process $script:DevSpaceProcess -Name 'DevSpace Git Bash launcher'
+
+        # Job Object assignment is best-effort for Git Bash. A process can
+        # already belong to another job (for example because of its host/MSYS
+        # environment), in which case Windows may reject another assignment.
+        # Do not abort a perfectly valid DevSpace launch because of that.
+        $script:DevSpaceJobProtected = Try-RegisterManagedProcess -Process $script:DevSpaceProcess -Name 'DevSpace Git Bash launcher'
+
+        # Independent watchdog is the cross-environment safety net. It observes
+        # this launcher process and kills the complete DevSpace process tree if
+        # the console is closed, Ctrl+C terminates the launcher, or PowerShell
+        # crashes before normal cleanup can run.
+        $watchdogReady = Start-DevSpaceWatchdog -DevSpaceLauncherPid ([int]$script:DevSpaceProcess.Id)
+
+        if (-not $script:DevSpaceJobProtected -and -not $watchdogReady) {
+            try {
+                & "$env:SystemRoot\System32\taskkill.exe" /PID $script:DevSpaceProcess.Id /T /F *> $null
+            } catch {}
+            throw 'Не удалось включить ни Windows Job Object, ни watchdog. Сервер остановлен, потому что launcher не может гарантировать отключение MCP при закрытии консоли.'
+        }
     } finally {
         if ($null -eq $oldConv) { Remove-Item Env:MSYS2_ARG_CONV_EXCL -ErrorAction SilentlyContinue }
         else { $env:MSYS2_ARG_CONV_EXCL = $oldConv }
@@ -2190,23 +3003,35 @@ function Start-DevSpaceServerBackground {
 
     for ($i=0; $i -lt 60; $i++) {
         Start-Sleep -Milliseconds 250
+
         if ($script:DevSpaceProcess.HasExited) {
             Show-DevSpaceServerFailureLogs
+            Stop-DevSpaceWatchdog
             throw "DevSpace server завершился сразу после запуска с кодом $($script:DevSpaceProcess.ExitCode)."
         }
+
         $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
         if ($listener) {
-            # The listener is normally the Node.js DevSpace process. Attach it
-            # explicitly as well, eliminating the tiny race where Git Bash could
-            # have spawned Node before Bash itself was assigned to the Job Object.
+            # Attach the actual listener to our Job Object when Windows permits
+            # it. Failure is non-fatal because watchdog already tracks the Bash
+            # process tree and also clears any remaining listener on port 7676.
             $listenerPids = @($listener | Select-Object -ExpandProperty OwningProcess -Unique)
             foreach ($listenerPid in $listenerPids) {
                 if ($listenerPid -and ($listenerPid -ne $PID)) {
-                    Register-ManagedPid -ProcessId ([int]$listenerPid) -Name 'DevSpace MCP listener'
+                    [void](Try-RegisterManagedPid -ProcessId ([int]$listenerPid) -Name 'DevSpace MCP listener')
                 }
             }
+
             Write-Ok "DevSpace MCP server запущен и слушает порт $Port."
-            Write-Info 'Защита доступа активна: закрытие этого окна или Ctrl+C автоматически остановит DevSpace и ngrok.'
+            Save-RuntimeState
+            if ($script:DevSpaceJobProtected -and $watchdogReady) {
+                Write-Info 'Защита доступа активна: Windows Job Object + независимый watchdog.'
+            } elseif ($watchdogReady) {
+                Write-Info 'Защита доступа активна: независимый watchdog (Job Object для Git Bash недоступен в этой среде).'
+            } else {
+                Write-Info 'Защита доступа активна: Windows Job Object.'
+            }
+            Write-Info 'Закрытие этого окна или Ctrl+C автоматически остановит DevSpace и ngrok.'
             return
         }
     }
@@ -2232,7 +3057,14 @@ function Show-RunningServerMenu {
         Write-Host ("  MCP Server URL : {0}/mcp" -f $PublicOrigin.TrimEnd('/')) -ForegroundColor Green
         Write-Host ("  DevSpace       : запущен, порт {0}" -f $Port) -ForegroundColor Green
         Write-Host '  ngrok          : запущен' -ForegroundColor Green
-        Write-Host '  Защита         : закрытие окна / Ctrl+C = немедленно оборвать MCP-доступ' -ForegroundColor Yellow
+        $protectionLabel = if ($script:DevSpaceJobProtected -and $script:DevSpaceWatchdogProcess) {
+            'Windows Job Object + watchdog'
+        } elseif ($script:DevSpaceWatchdogProcess) {
+            'watchdog'
+        } else {
+            'Windows Job Object'
+        }
+        Write-Host ("  Защита         : {0}; закрытие окна / Ctrl+C = оборвать MCP-доступ" -f $protectionLabel) -ForegroundColor Yellow
         Write-Host ''
         Write-Host '  [1] Изменить разрешённые папки и применить' -ForegroundColor Green
         Write-Host '      Если папки изменятся, DevSpace перезапустится автоматически.' -ForegroundColor Gray
@@ -2373,6 +3205,7 @@ try {
     Write-Host 'ngrok ставится напрямую из официального ZIP; Microsoft Store используется только как резервный вариант.' -ForegroundColor Gray
     Write-Host ("Журнал: {0}" -f $LogPath) -ForegroundColor DarkGray
 
+    Invoke-StartupProcessCleanup
     Prepare-PowerShellPolicy
     $winget = Ensure-Winget
     Ensure-Git -Winget $winget
@@ -2417,8 +3250,11 @@ catch {
     exit 1
 }
 finally {
-    # Final safety net. Closing the Job Object terminates any managed DevSpace/ngrok
-    # process that might still be alive, even if an earlier cleanup path failed.
+    # Final safety net. Normal session cleanup should already have stopped the
+    # watchdog and child processes. Keep both guards here for abnormal paths.
+    try { Stop-DevSpaceServerBackground } catch {}
+    try { Stop-NgrokTunnelBackground } catch {}
+    try { Stop-DevSpaceWatchdog } catch {}
     try { [DevSpaceMcp.ProcessGuard]::Shutdown() } catch {}
     Stop-Log
 }
