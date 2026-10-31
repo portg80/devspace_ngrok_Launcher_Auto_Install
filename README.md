@@ -6,6 +6,8 @@
 
 <p align="center">
   Дайте вашему чату в браузере доступ к папке на компьютере, больше не нужно вручную заменять файлы на пк и отправлять их в чат на редактирование, теперь все автоматически с помощью DevSpace MCP! 
+</p>
+<p align="center">
   Этот лаунчер автоматически установит все зависимости для запуска DevSpace MCP (агентные навыки через плагин) + ngrok (туннелирование mcp в интернет) для ChatGPT на Windows.
 </p>
 
@@ -15,6 +17,9 @@
   <img src="https://img.shields.io/badge/ngrok-supported-1F1E37?logo=ngrok" alt="ngrok">
   <img src="https://img.shields.io/badge/setup-automatic-22C55E" alt="Automatic setup">
 </p>
+
+<img width="1024" height="1536" alt="image" src="https://github.com/user-attachments/assets/31da1272-a98a-4685-bb5e-88a42e811b70" />
+
 
 ---
 
