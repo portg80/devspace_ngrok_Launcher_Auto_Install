@@ -51,7 +51,7 @@ try {
     New-Item -ItemType Directory -Path $RuntimeDir -Force | Out-Null
 }
 $RuntimeStatePath = Join-Path $RuntimeDir 'runtime.json'
-$ScriptVersion = '1.3.9'
+$ScriptVersion = '1.3.13'
 
 try { [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false) } catch {}
 try { [Console]::InputEncoding  = New-Object Text.UTF8Encoding($false) } catch {}
@@ -2074,6 +2074,66 @@ function Ensure-DevSpace {
     return $installed
 }
 
+function Ensure-DevSpaceUtf8ShellPatch {
+    param([pscustomobject]$NodeInfo)
+
+    $npmRootResult = Invoke-Native -FilePath $NodeInfo.Npm -Arguments @('root','-g') -AllowFailure -Quiet
+    if ($npmRootResult.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($npmRootResult.Output)) {
+        Write-Warn 'Не удалось определить глобальный npm root; UTF-8 патч DevSpace не применён.'
+        return
+    }
+
+    $npmRoot = ($npmRootResult.Output -split "`r?`n" |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Select-Object -Last 1).Trim()
+
+    $dist = Join-Path $npmRoot '@waishnav\devspace\dist'
+    $processPlatform = Join-Path $dist 'process-platform.js'
+    $processSessions = Join-Path $dist 'process-sessions.js'
+
+    foreach ($required in @($processPlatform, $processSessions)) {
+        if (-not (Test-Path -LiteralPath $required)) {
+            Write-Warn "Не найден $required; UTF-8 патч DevSpace пропущен."
+            return
+        }
+    }
+
+    $utf8NoBom = New-Object Text.UTF8Encoding($false)
+
+    $platformSource = [IO.File]::ReadAllText($processPlatform, [Text.Encoding]::UTF8)
+    $platformOriginal = 'args: ["/d", "/s", "/c", command],'
+    $platformPatched = 'args: ["/d", "/s", "/c", `chcp 65001>nul && ${command}`],'
+
+    if (-not $platformSource.Contains($platformPatched)) {
+        if (-not $platformSource.Contains($platformOriginal)) {
+            Write-Warn 'DevSpace process-platform.js изменился; автоматический UTF-8 патч требует проверки.'
+            return
+        }
+        [IO.File]::WriteAllText(
+            $processPlatform,
+            $platformSource.Replace($platformOriginal, $platformPatched),
+            $utf8NoBom
+        )
+    }
+
+    $sessionsSource = [IO.File]::ReadAllText($processSessions, [Text.Encoding]::UTF8)
+    $sessionsOriginal = 'const child = spawn(input.command, {'
+    $sessionsPatched = 'const child = spawn(`chcp 65001>nul && ${input.command}`, {'
+
+    if (-not $sessionsSource.Contains($sessionsPatched)) {
+        if (-not $sessionsSource.Contains($sessionsOriginal)) {
+            Write-Warn 'DevSpace process-sessions.js изменился; автоматический UTF-8 патч требует проверки.'
+            return
+        }
+        [IO.File]::WriteAllText(
+            $processSessions,
+            $sessionsSource.Replace($sessionsOriginal, $sessionsPatched),
+            $utf8NoBom
+        )
+    }
+
+    Write-Ok 'DevSpace exec_command настроен на UTF-8 для обычного pipe и PTY режима.'
+}
 function Escape-BashSingleQuote {
     param([string]$Text)
     # PublicOrigin is normalized to scheme + host + optional port only, so double quotes are safe.
@@ -2685,7 +2745,17 @@ function Start-NgrokTunnel {
     } else {
         Write-Info 'Запускаю ngrok со случайным HTTPS URL.'
     }
+    # The launcher may have read the token from an MSIX/Store ngrok config,
+    # whereas the selected standalone ngrok.exe reads a different config.
+    # Pass the already configured token to the spawned ngrok process using
+    # NGROK_AUTHTOKEN, without exposing it in command-line arguments or logs.
+    $authState = Get-NgrokAuthState
+    if (-not $authState.Readable -or [string]::IsNullOrWhiteSpace($authState.Token)) {
+        throw 'ngrok Authtoken не найден. Настройте токен в меню лаунчера перед запуском.'
+    }
+    $previousToken = [Environment]::GetEnvironmentVariable('NGROK_AUTHTOKEN', 'Process')
     try {
+        [Environment]::SetEnvironmentVariable('NGROK_AUTHTOKEN', $authState.Token, 'Process')
         $script:NgrokProcess = Start-Process -FilePath $script:NgrokExe -ArgumentList $args -PassThru -WindowStyle Hidden -RedirectStandardOutput $script:NgrokStdOut -RedirectStandardError $script:NgrokStdErr
         Register-ManagedProcess -Process $script:NgrokProcess -Name 'ngrok'
         Save-RuntimeState
@@ -2714,6 +2784,10 @@ function Start-NgrokTunnel {
         }
 
         throw "Не удалось запустить ngrok: $launchError"
+    } finally {
+        # Restore the launcher's previous environment, including on retry/failure.
+        [Environment]::SetEnvironmentVariable('NGROK_AUTHTOKEN', $previousToken, 'Process')
+        $authState = $null
     }
 
     $url = $null
@@ -2740,6 +2814,15 @@ function Start-NgrokTunnel {
         $fixed = Repair-NgrokVersion -Winget $Winget
         $script:NgrokExe = $fixed.Path
         return Start-NgrokTunnel -Mode $Mode -Settings $Settings -Winget $Winget -RetryAfterRepair
+    }
+    if ($combined -match 'ERR_NGROK_4018') {
+        Write-NoticeBox -Title 'NGROK НЕ ПРИНЯЛ АВТОРИЗАЦИЮ' -Lines @(
+            'Лаунчер передал сохранённый Authtoken в процесс ngrok.'
+            'Если ERR_NGROK_4018 повторяется, проверьте токен в ngrok dashboard.'
+            'Затем в меню лаунчера введите полный актуальный Authtoken заново.'
+            'Не отправляйте сам токен в чат или диагностический лог.'
+        )
+        throw 'ngrok отклонил авторизацию (ERR_NGROK_4018). Проверьте сохранённый Authtoken.'
     }
     if ($combined -match 'ERR_NGROK_9040') {
         Write-NoticeBox -Title 'NGROK НЕ РАЗРЕШАЕТ ПОДКЛЮЧЕНИЕ С ТЕКУЩЕГО IP' -Lines @(
@@ -3212,6 +3295,7 @@ try {
     $nodeInfo = Ensure-Node -Winget $winget
     $ngrokInfo = Ensure-Ngrok -Winget $winget
     $devspaceVersion = Ensure-DevSpace -NodeInfo $nodeInfo
+    Ensure-DevSpaceUtf8ShellPatch -NodeInfo $nodeInfo
     Show-VersionSummary -Winget $winget -NodeInfo $nodeInfo -NgrokInfo $ngrokInfo -DevSpaceVersion $devspaceVersion
 
     $settings = Load-Settings
