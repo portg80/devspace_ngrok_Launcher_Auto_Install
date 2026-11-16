@@ -205,7 +205,6 @@ DevSpace ✓
 - diagnostic utility.
 
 ---
-
 # Быстрый старт
 
 ## 1. Скачайте launcher
