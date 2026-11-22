@@ -24,12 +24,12 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 # -----------------------------------------------------------------------------
-# DevSpace MCP all-in-one installer / launcher for Windows 10/11
+# DevSpace MCP Secure Tunnel launcher for Windows 10/11
 # - no PowerShell execution-policy prerequisite: CMD bootstrap uses Bypass
 # - idempotent dependency checks and installs
 # - WinGet recovery chain
-# - Git + Git Bash, compatible Node.js LTS, ngrok, DevSpace
-# - ngrok authtoken + fixed/random tunnel
+# - Git + Git Bash, compatible Node.js LTS, Secure MCP Tunnel client, DevSpace
+# - OpenAI Secure MCP Tunnel with outbound-only HTTPS and local OAuth bridge
 # - DevSpace init/config/doctor through Git Bash
 # - full visible errors + transcript logs (secrets excluded where practical)
 # -----------------------------------------------------------------------------
@@ -39,8 +39,10 @@ $ScriptDir  = Split-Path -Parent $ScriptPath
 $Port       = 7676
 $MinNode    = [Version]'22.19.0'
 $MaxNode    = [Version]'27.0.0'
-$MinNgrok   = [Version]'3.20.0'
-$SettingsPath = Join-Path $ScriptDir 'devspace-mcp-settings.json'
+$MinTunnelClient = [Version]'0.0.19'
+
+$SettingsPath = Join-Path $ScriptDir 'devspace-secure-tunnel-settings.json'
+$DotEnvPath = Join-Path $ScriptDir '.env'
 $LegacyDomainPath = Join-Path $ScriptDir 'dev-domain.txt'
 $LogDir = Join-Path $ScriptDir 'logs'
 $RuntimeDir = Join-Path $env:LOCALAPPDATA 'DevSpaceMCPLauncher'
@@ -51,7 +53,7 @@ try {
     New-Item -ItemType Directory -Path $RuntimeDir -Force | Out-Null
 }
 $RuntimeStatePath = Join-Path $RuntimeDir 'runtime.json'
-$ScriptVersion = '1.3.13'
+$ScriptVersion = '2.5.5'
 
 try { [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false) } catch {}
 try { [Console]::InputEncoding  = New-Object Text.UTF8Encoding($false) } catch {}
@@ -106,12 +108,21 @@ $script:TranscriptActive = $false
 $script:CurrentStep = 0
 $script:GitBash = $null
 $script:GitMintty = $null
-$script:NgrokExe = $null
-$script:NgrokConfigPathHint = $null
-$script:NgrokProcess = $null
-$script:NgrokStdOut = $null
-$script:NgrokStdErr = $null
-$script:NgrokFailureLogsShown = $false
+$script:TunnelExe = $null
+$script:TunnelProcess = $null
+$script:TunnelStdOut = $null
+$script:TunnelStdErr = $null
+$script:BridgeProcess = $null
+$script:BridgeStdOut = $null
+$script:BridgeStdErr = $null
+$script:BridgePort = 7677
+$script:HealthPort = 7680
+$script:RuntimeKey = $null
+$script:SelectedAdminKey = ''
+$script:RuntimeKeyChanged = $false
+$script:AdminKeyChanged = $false
+$script:AdminSelectionBack = $false
+$script:NewAccountBinding = $false
 $script:DevSpaceProcess = $null
 $script:DevSpaceStdOut = $null
 $script:DevSpaceStdErr = $null
@@ -122,12 +133,12 @@ $script:DevSpaceJobProtected = $false
 # -----------------------------------------------------------------------------
 # Process lifetime guard
 #
-# DevSpace and ngrok are intentionally attached to a Windows Job Object with
+# DevSpace, the local OAuth bridge, and tunnel-client are attached to a Windows Job Object with
 # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE. This gives us a security property that a
 # PowerShell finally block alone cannot provide: if this launcher is terminated
 # by Ctrl+C, the console window is closed, PowerShell crashes, or the launcher
 # is otherwise killed, Windows closes the job handle and terminates the managed
-# MCP/ngrok processes automatically.
+# MCP/tunnel processes automatically.
 # -----------------------------------------------------------------------------
 $processGuardSource = @'
 using System;
@@ -542,7 +553,8 @@ function Save-RuntimeState {
             }
             port = [int]$Port
             devspace = Get-RuntimeProcessRecord -Process $script:DevSpaceProcess
-            ngrok = Get-RuntimeProcessRecord -Process $script:NgrokProcess
+            tunnel = Get-RuntimeProcessRecord -Process $script:TunnelProcess
+            bridge = Get-RuntimeProcessRecord -Process $script:BridgeProcess
             watchdog = Get-RuntimeProcessRecord -Process $script:DevSpaceWatchdogProcess
             updatedAt = [DateTime]::UtcNow.ToString('o')
         }
@@ -575,7 +587,8 @@ function Stop-StaleProcessesFromRuntimeState {
     foreach ($spec in @(
         [pscustomobject]@{ Property='watchdog'; Label='старый watchdog DevSpace' },
         [pscustomobject]@{ Property='devspace'; Label='старый DevSpace MCP' },
-        [pscustomobject]@{ Property='ngrok'; Label='старый ngrok MCP' }
+        [pscustomobject]@{ Property='tunnel'; Label='старый DevSpace Secure Tunnel' },
+        [pscustomobject]@{ Property='bridge'; Label='старый DevSpace OAuth bridge' }
     )) {
         $property = $state.PSObject.Properties[$spec.Property]
         if (-not $property -or $null -eq $property.Value) { continue }
@@ -690,52 +703,7 @@ function Stop-StaleDevSpaceListener {
     return $stopped
 }
 
-function Stop-StaleNgrokForDevSpace {
-    $stopped = 0
 
-    try {
-        $ngrokProcesses = @(Get-CimInstance Win32_Process -Filter "Name='ngrok.exe'" -ErrorAction SilentlyContinue)
-    } catch {
-        $ngrokProcesses = @()
-    }
-
-    foreach ($p in $ngrokProcesses) {
-        $cmd = [string]$p.CommandLine
-        if ([string]::IsNullOrWhiteSpace($cmd)) { continue }
-
-        $targetsPort = (
-            ($cmd -match ('(?i)\bhttp\b.*(?:\s|=)' + [regex]::Escape([string]$Port) + '(?:\s|$)')) -or
-            ($cmd -match ('(?i)(?:\s|=)' + [regex]::Escape([string]$Port) + '(?:\s|$).*\bhttp\b'))
-        )
-
-        if ($targetsPort) {
-            if (Stop-ProcessTreeTargeted -ProcessId ([int]$p.ProcessId) -Label 'старый ngrok-туннель DevSpace') {
-                $stopped++
-            }
-        }
-    }
-
-    # MSIX can occasionally hide/normalize CommandLine. If Inspector confirms
-    # that its only running tunnel forwards to our MCP port and there is exactly
-    # one ngrok.exe, identify that process as ours.
-    if ($stopped -eq 0 -and @($ngrokProcesses).Count -eq 1) {
-        try {
-            $tunnels = Invoke-RestMethod -Uri 'http://127.0.0.1:4040/api/tunnels' -TimeoutSec 1 -ErrorAction Stop
-            $ours = @($tunnels.tunnels | Where-Object {
-                $addr = [string]$_.config.addr
-                $addr -match ('(?i)(?:^|:)' + [regex]::Escape([string]$Port) + '$')
-            })
-
-            if ($ours.Count -gt 0) {
-                if (Stop-ProcessTreeTargeted -ProcessId ([int]$ngrokProcesses[0].ProcessId) -Label 'старый ngrok-туннель DevSpace') {
-                    $stopped++
-                }
-            }
-        } catch {}
-    }
-
-    return $stopped
-}
 
 function Invoke-StartupProcessCleanup {
     Write-Rule 'ПРЕДСТАРТОВАЯ ПРОВЕРКА ОСТАТОЧНЫХ ПРОЦЕССОВ'
@@ -744,7 +712,6 @@ function Invoke-StartupProcessCleanup {
     $total += Stop-StaleProcessesFromRuntimeState
     $total += Stop-StaleLauncherWatchdogs
     $total += Stop-StaleDevSpaceListener
-    $total += Stop-StaleNgrokForDevSpace
 
     Start-Sleep -Milliseconds 500
 
@@ -781,8 +748,7 @@ function Stop-Log {
 function Read-HostWithoutTranscript {
     param([Parameter(Mandatory=$true)][string]$Prompt)
 
-    # Keep the user's input visible in the console, but do not persist secrets
-    # such as the ngrok Authtoken into Start-Transcript logs.
+    # Keep input out of Start-Transcript logs when it may contain secrets.
     $resumeTranscript = $script:TranscriptActive
     if ($resumeTranscript) { Stop-Log }
     try {
@@ -1386,605 +1352,938 @@ function Ensure-Node {
     return [pscustomobject]@{ Node=$node.Path; Npm=$npm; Npx=$npx; Version=$node.Version; Lts=$node.Lts }
 }
 
-function Get-NgrokCandidates {
-    Refresh-ProcessPath
-    $candidates = New-Object System.Collections.Generic.List[string]
-    try {
-        Get-Command ngrok.exe -All -ErrorAction Stop | ForEach-Object {
-            $p = if ($_.Source) { $_.Source } else { $_.Path }
-            if ($p -and -not $candidates.Contains($p)) { [void]$candidates.Add($p) }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+function Get-TunnelClientPath {
+    $list = New-Object System.Collections.Generic.List[string]
+    $found = Get-Command tunnel-client.exe -ErrorAction SilentlyContinue
+    if ($found) { $list.Add([string]$found.Source) }
+    # Reuse the same tunnel-client binary as Start-Agent-Infrastructure.ps1 when present.
+    $list.Add((Join-Path $HOME 'Tools\mcp\tunnel-client-dist\tunnel-client.exe'))
+    $list.Add((Join-Path $HOME 'Tools\mcp\tunnel-client.exe'))
+    $list.Add((Join-Path $env:LOCALAPPDATA 'Programs\tunnel-client\tunnel-client.exe'))
+    $list.Add((Join-Path $env:LOCALAPPDATA 'tunnel-client\tunnel-client.exe'))
+    foreach ($path in $list) {
+        if ((Test-Path -LiteralPath $path -PathType Leaf) -and ($path -notmatch '^(?i:https?://)')) {
+            $verified = Test-TunnelClientBinary -Path $path
+            if ($verified.Compatible) { return $path }
         }
-    } catch {}
-    foreach ($p in @(
-        (Join-Path $env:LOCALAPPDATA 'Programs\ngrok\ngrok.exe'),
-        (Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\ngrok.exe'),
-        (Join-Path $env:USERPROFILE 'scoop\shims\ngrok.exe')
+    }
+    return $null
+}
+
+function Test-TunnelClientBinary {
+    param([Parameter(Mandatory=$true)][string]$Path)
+    $r = Invoke-Native -FilePath $Path -Arguments @('--version') -AllowFailure -Quiet
+    if ($r.ExitCode -ne 0) { return [pscustomobject]@{ Compatible=$false; Version=''; Reason='Команда --version не работает.' } }
+    $v = ConvertTo-Version -Text $r.Output
+    if (-not $v) { return [pscustomobject]@{ Compatible=$false; Version=''; Reason='Версия не распознана.' } }
+    if ($v -lt $MinTunnelClient) {
+        return [pscustomobject]@{ Compatible=$false; Version=$v; Reason=("Нужна версия не ниже {0}." -f $MinTunnelClient) }
+    }
+    foreach ($check in @(
+        [pscustomobject]@{ Args=@('run','--help'); Flags=@('--control-plane.tunnel-id','--mcp.server-url','--health.listen-addr') },
+        [pscustomobject]@{ Args=@('admin','tunnels','list','--help'); Flags=@('--organization-id','--workspace-id') },
+        [pscustomobject]@{ Args=@('admin','tunnels','create','--help'); Flags=@('--organization-id','--workspace-id') },
+        [pscustomobject]@{ Args=@('runtimes','status','--help'); Flags=@() }
     )) {
-        if ($p -and (Test-Path -LiteralPath $p) -and -not $candidates.Contains($p)) { [void]$candidates.Add($p) }
-    }
-    return $candidates.ToArray()
-}
-
-function Get-NgrokInfo {
-    $best = $null
-    foreach ($path in (Get-NgrokCandidates)) {
-        $r = Invoke-Native -FilePath $path -Arguments @('--version') -AllowFailure -Quiet
-        if ($r.ExitCode -ne 0) { $r = Invoke-Native -FilePath $path -Arguments @('version') -AllowFailure -Quiet }
-        if ($r.ExitCode -ne 0) { continue }
-        $v = ConvertTo-Version $r.Output
-        if (-not $v) { continue }
-        $item = [pscustomobject]@{ Path=$path; Version=$v; Raw=$r.Output.Trim() }
-        if (-not $best -or $item.Version -gt $best.Version) { $best = $item }
-    }
-    return $best
-}
-
-function Find-Ngrok {
-    $ng = Get-NgrokInfo
-    if ($ng) { return $ng.Path }
-    return $null
-}
-
-function Add-UserPathEntry {
-    param([Parameter(Mandatory=$true)][string]$Directory)
-    $dir = [IO.Path]::GetFullPath($Directory).TrimEnd('\')
-    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    $parts = @($userPath -split ';' | Where-Object { $_ -and $_.Trim() })
-    $exists = $false
-    foreach ($p in $parts) {
-        try {
-            if ([IO.Path]::GetFullPath($p).TrimEnd('\') -ieq $dir) { $exists = $true; break }
-        } catch {
-            if ($p.TrimEnd('\') -ieq $dir) { $exists = $true; break }
+        $helpResult = Invoke-Native -FilePath $Path -Arguments $check.Args -AllowFailure -Quiet
+        if ($helpResult.ExitCode -ne 0) {
+            return [pscustomobject]@{ Compatible=$false; Version=$v; Reason=("Недоступна команда {0}." -f ($check.Args -join ' ')) }
         }
-    }
-    if (-not $exists) {
-        $newPath = (($parts + $dir) -join ';')
-        [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
-        Write-Info "Добавлено в пользовательский PATH: $dir"
-    }
-    Refresh-ProcessPath
-}
-
-function Invoke-DownloadFileVisible {
-    param(
-        [Parameter(Mandatory=$true)][string]$Url,
-        [Parameter(Mandatory=$true)][string]$OutFile,
-        [string]$Label = 'файл'
-    )
-
-    Reset-ConsoleLayout
-    Write-Host ''
-    Write-Host ("  [СИСТЕМНЫЙ ВЫВОД] Загрузка {0}" -f $Label) -ForegroundColor DarkGray
-    Write-Host ("  URL: {0}" -f $Url) -ForegroundColor DarkGray
-    Write-Host ('  ' + ('·' * 74)) -ForegroundColor DarkGray
-
-    $response = $null
-    $responseStream = $null
-    $output = $null
-    try {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        $request = [Net.HttpWebRequest]::Create($Url)
-        $request.Method = 'GET'
-        $request.AllowAutoRedirect = $true
-        $request.UserAgent = "DevSpace-MCP-Bootstrap/$ScriptVersion"
-        $request.Timeout = 30000
-        $request.ReadWriteTimeout = 30000
-        $response = $request.GetResponse()
-
-        $length = [int64]$response.ContentLength
-        $responseStream = $response.GetResponseStream()
-        $output = [IO.File]::Open($OutFile, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
-        [byte[]]$buffer = New-Object byte[] 131072
-        [int64]$downloaded = 0
-        $sw = [Diagnostics.Stopwatch]::StartNew()
-        $lastReportMs = -1500
-
-        while (($read = $responseStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
-            $output.Write($buffer, 0, $read)
-            $downloaded += $read
-
-            if (($sw.ElapsedMilliseconds - $lastReportMs) -ge 1500) {
-                $mb = [Math]::Round($downloaded / 1MB, 1)
-                if ($length -gt 0) {
-                    $totalMb = [Math]::Round($length / 1MB, 1)
-                    $pct = [Math]::Min(100, [Math]::Round(($downloaded * 100.0) / $length, 0))
-                    Write-Host ("  Загружено: {0} / {1} МБ ({2}%)" -f $mb, $totalMb, $pct) -ForegroundColor DarkGray
-                } else {
-                    Write-Host ("  Загружено: {0} МБ" -f $mb) -ForegroundColor DarkGray
-                }
-                $lastReportMs = $sw.ElapsedMilliseconds
+        foreach ($flag in $check.Flags) {
+            if (-not $helpResult.Output.Contains($flag)) {
+                return [pscustomobject]@{ Compatible=$false; Version=$v; Reason=("Не поддерживается {0}." -f $flag) }
             }
         }
-        $output.Flush()
-
-        $finalMb = [Math]::Round($downloaded / 1MB, 1)
-        Write-Host ("  Загрузка завершена: {0} МБ" -f $finalMb) -ForegroundColor DarkGray
-        Write-Host ('  ' + ('·' * 74)) -ForegroundColor DarkGray
-    } catch {
-        Reset-ConsoleLayout
-        Write-Host ('  ' + ('·' * 74)) -ForegroundColor DarkRed
-        Write-Host $_.Exception.ToString() -ForegroundColor Red
-        throw
-    } finally {
-        if ($output) { try { $output.Dispose() } catch {} }
-        if ($responseStream) { try { $responseStream.Dispose() } catch {} }
-        if ($response) { try { $response.Dispose() } catch {} }
-        Reset-ConsoleLayout
     }
+    return [pscustomobject]@{ Compatible=$true; Version=$v; Reason='' }
 }
 
-function Install-NgrokStandalone {
-    Write-Info 'Основной способ установки ngrok: официальный standalone ZIP с ngrok.com.'
-    Write-Info 'Microsoft Store используется только как резервный вариант, если ZIP скачать/установить не удалось.'
-
-    $arch = $env:PROCESSOR_ARCHITECTURE
-    if ($env:PROCESSOR_ARCHITEW6432) { $arch = $env:PROCESSOR_ARCHITEW6432 }
-    switch -Regex ($arch) {
-        'ARM64' { $ngrokArch = 'arm64' }
-        'AMD64|x86_64' { $ngrokArch = 'amd64' }
-        default { throw "Не удалось подобрать standalone ngrok для архитектуры '$arch'." }
-    }
-
-    $url = "https://bin.ngrok.com/c/bNyj1mQVY4c/ngrok-v3-stable-windows-$ngrokArch.zip"
-    $installDir = Join-Path $env:LOCALAPPDATA 'Programs\ngrok'
-    $zip = Join-Path $env:TEMP ("ngrok-v3-{0}-{1}.zip" -f $ngrokArch, [Guid]::NewGuid().ToString('N'))
-    $extractDir = $null
-    New-Item -ItemType Directory -Path $installDir -Force | Out-Null
-
+function Get-TunnelReleaseMetadata {
+    param([string]$Arch)
+    $headers = @{ 'User-Agent'='DevSpace-Secure-Tunnel-Launcher'; 'Accept'='application/vnd.github+json' }
     try {
-        Invoke-DownloadFileVisible -Url $url -OutFile $zip -Label 'официального ngrok ZIP'
+        $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/openai/tunnel-client/releases/latest' -Headers $headers -TimeoutSec 25
+        if ($release.tag_name -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') { throw 'Неподдерживаемый тег релиза.' }
+        return $release
     } catch {
-        throw "Не удалось скачать официальный ZIP ngrok: $($_.Exception.Message)"
+        Write-Warn ("GitHub API недоступен: {0}. Проверяю страницу релиза." -f $_.Exception.Message)
     }
-
     try {
-        Write-Host '  Распаковка архива...' -ForegroundColor DarkGray
-        $extractDir = Join-Path $env:TEMP ("ngrok-extract-{0}" -f [Guid]::NewGuid().ToString('N'))
-        New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
-        Expand-Archive -LiteralPath $zip -DestinationPath $extractDir -Force
-        $exe = Get-ChildItem -Path $extractDir -Filter 'ngrok.exe' -File -Recurse | Select-Object -First 1
-        if (-not $exe) { throw 'В скачанном архиве не найден ngrok.exe.' }
-        Copy-Item -LiteralPath $exe.FullName -Destination (Join-Path $installDir 'ngrok.exe') -Force
-        try { Unblock-File -LiteralPath (Join-Path $installDir 'ngrok.exe') -ErrorAction SilentlyContinue } catch {}
-    } finally {
-        Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
-        if ($extractDir) { Remove-Item -LiteralPath $extractDir -Recurse -Force -ErrorAction SilentlyContinue }
-    }
-
-    Add-UserPathEntry -Directory $installDir
-    $test = Invoke-Native -FilePath (Join-Path $installDir 'ngrok.exe') -Arguments @('--version') -AllowFailure -Quiet
-    if ($test.ExitCode -ne 0) { throw 'Standalone ngrok скачан, но ngrok.exe не запускается.' }
-    Write-Ok ("ngrok установлен из официального ZIP: {0}" -f $test.Output.Trim())
-}
-
-function Install-NgrokFromStore {
-    param([string]$Winget)
-    Write-Warn 'Официальный ZIP ngrok не сработал. Пробую резервный канал: Microsoft Store через WinGet.'
-    Write-Info 'Watchdog Microsoft Store: 180 секунд. При зависании скрипт остановит WinGet и покажет ошибку.'
-    $r = Install-WingetPackage -Winget $Winget -IdOrName 'ngrok' -Source 'msstore' -TimeoutSeconds 180 -AllowFailure
-    Reset-ConsoleLayout
-    Refresh-ProcessPath
-    $ng = Get-NgrokInfo
-    if ($ng) {
-        Write-Ok ("ngrok появился после резервной установки Microsoft Store: {0}" -f $ng.Raw)
-        return $ng
-    }
-    if ($r.TimedOut) {
-        Write-Warn 'Microsoft Store не завершил резервную установку ngrok за 180 секунд.'
-    } else {
-        Write-Warn ("Microsoft Store не установил рабочий ngrok (код WinGet: {0})." -f $r.ExitCode)
-    }
-    return $null
-}
-
-function Install-NgrokPreferred {
-    param([string]$Winget)
-
-    try {
-        Install-NgrokStandalone
-        Refresh-ProcessPath
-        $ng = Get-NgrokInfo
-        if ($ng) { return $ng }
-        throw 'После установки из ZIP ngrok.exe не обнаружен.'
-    } catch {
-        Reset-ConsoleLayout
-        Write-Warn ("Установка ngrok из официального ZIP не удалась: {0}" -f $_.Exception.Message)
-        return (Install-NgrokFromStore -Winget $Winget)
-    }
-}
-
-function Repair-NgrokVersion {
-    param([string]$Winget)
-    Write-Warn 'Обнаружена устаревшая/несовместимая версия ngrok. Исправляю установку.'
-    $old = Find-Ngrok
-    if ($old) {
-        $upd = Invoke-Native -FilePath $old -Arguments @('update') -AllowFailure
-        Refresh-ProcessPath
-        $after = Get-NgrokInfo
-        if ($after -and $after.Version -and $after.Version -ge $MinNgrok) {
-            Write-Ok ("ngrok обновлён: {0}" -f $after.Raw)
-            return $after
+        $response = Invoke-WebRequest -Uri 'https://github.com/openai/tunnel-client/releases/latest' -UseBasicParsing -TimeoutSec 25 -MaximumRedirection 10
+        $url = [string]$response.BaseResponse.ResponseUri.AbsoluteUri
+        if ($url -notmatch '/releases/tag/(v[0-9]+\.[0-9]+\.[0-9]+)(?:[/?#]|$)') {
+            throw 'Не удалось определить тег последнего релиза.'
         }
-    }
-
-    Write-Info 'Удаляю старый пакет Ngrok.Ngrok из community-репозитория WinGet (если он установлен).'
-    Invoke-Native -FilePath $Winget -Arguments @('uninstall','--id','Ngrok.Ngrok','-e','--source','winget','--silent','--disable-interactivity') -AllowFailure | Out-Null
-    $after = Install-NgrokPreferred -Winget $Winget
-    if (-not $after) { throw 'ngrok не найден после восстановления установки.' }
-    return $after
-}
-
-function Ensure-Ngrok {
-    param([string]$Winget)
-    Write-Step 'ngrok: установка и проверка версии'
-    $ng = Get-NgrokInfo
-    if (-not $ng) {
-        $ng = Install-NgrokPreferred -Winget $Winget
-    }
-    if (-not $ng) { throw 'ngrok не найден после установки.' }
-    Write-Info ("Найдено: {0}; путь: {1}" -f $ng.Raw, $ng.Path)
-    if (-not $ng.Version -or $ng.Version -lt $MinNgrok) {
-        $ng = Repair-NgrokVersion -Winget $Winget
-    }
-    if (-not $ng.Version -or $ng.Version -lt $MinNgrok) {
-        $all = (& where.exe ngrok.exe 2>$null) -join '; '
-        throw "Активная версия ngrok всё ещё ниже $MinNgrok. Найденные ngrok.exe: $all"
-    }
-    Write-Ok ("ngrok совместим: {0}" -f $ng.Raw)
-    $script:NgrokExe = $ng.Path
-    return $ng
-}
-
-function Get-NgrokConfigCheckInfo {
-    $result = [ordered]@{
-        ExitCode = -1
-        Output   = ''
-        Path     = $null
-    }
-
-    if (-not $script:NgrokExe) {
-        return [pscustomobject]$result
-    }
-
-    try {
-        $r = Invoke-Native -FilePath $script:NgrokExe -Arguments @('config','check') -AllowFailure -Quiet
-        $result.ExitCode = $r.ExitCode
-        $result.Output = [string]$r.Output
-
-        foreach ($line in ($r.Output -split '\r?\n')) {
-            # Strip ANSI escape sequences before parsing a Windows path.
-            $clean = [regex]::Replace([string]$line, "$([char]27)\[[0-9;?]*[ -/]*[@-~]", '')
-            $m = [regex]::Match($clean, '(?i)(?<path>[A-Za-z]:\\.*?\.ya?ml)(?:"|''|\s|$)')
-            if ($m.Success) {
-                $candidate = $m.Groups['path'].Value.Trim()
-                if (Test-Path -LiteralPath $candidate -PathType Leaf) {
-                    $result.Path = (Resolve-Path -LiteralPath $candidate).Path
-                    break
-                }
-            }
-        }
+        $tag = $Matches[1]
+        $filename = 'tunnel-client-{0}-windows-{1}.zip' -f $tag,$Arch
+        $base = 'https://github.com/openai/tunnel-client/releases/download/' + $tag + '/'
+        Write-Info ("Версия {0} получена через страницу релизов." -f $tag)
+        return [pscustomobject]@{ tag_name=$tag; assets=@(
+            [pscustomobject]@{ name=$filename; browser_download_url=($base+$filename); digest='' },
+            [pscustomobject]@{ name='SHA256SUMS.txt'; browser_download_url=($base+'SHA256SUMS.txt') }
+        ) }
     } catch {
-        $result.Output = $_.Exception.Message
-    }
-
-    return [pscustomobject]$result
-}
-
-function Add-UniqueExistingPath {
-    param(
-        [Parameter(Mandatory=$true)]$List,
-        [string]$Path
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Path)) { return }
-
-    try {
-        $clean = [Environment]::ExpandEnvironmentVariables(
-            $Path.Trim().Trim([char]34, [char]39, [char]32)
-        )
-        if (-not (Test-Path -LiteralPath $clean -PathType Leaf)) { return }
-
-        $resolved = (Resolve-Path -LiteralPath $clean).Path
-        foreach ($existing in $List) {
-            if ([string]::Equals([string]$existing, $resolved, [StringComparison]::OrdinalIgnoreCase)) {
-                return
-            }
-        }
-        [void]$List.Add($resolved)
-    } catch {}
-}
-
-function Get-NgrokConfigPaths {
-    $paths = New-Object 'System.Collections.Generic.List[string]'
-
-    # 1. Exact path learned during this launcher run.
-    Add-UniqueExistingPath -List $paths -Path $script:NgrokConfigPathHint
-
-    # 2. Explicit ngrok override.
-    Add-UniqueExistingPath -List $paths -Path $env:NGROK_CONFIG
-
-    # 3. Ask the active ngrok executable for the config it actually validates.
-    $check = Get-NgrokConfigCheckInfo
-    Add-UniqueExistingPath -List $paths -Path $check.Path
-
-    # 4. Official/default Windows locations for current and legacy ngrok.
-    $known = @(
-        (Join-Path $env:LOCALAPPDATA 'ngrok\ngrok.yml'),
-        (Join-Path $env:LOCALAPPDATA 'ngrok\ngrok.yaml'),
-        (Join-Path $env:USERPROFILE 'AppData\Local\ngrok\ngrok.yml'),
-        (Join-Path $env:USERPROFILE 'AppData\Local\ngrok\ngrok.yaml'),
-        (Join-Path $env:USERPROFILE '.config\ngrok\ngrok.yml'),
-        (Join-Path $env:USERPROFILE '.config\ngrok\ngrok.yaml'),
-        (Join-Path $env:USERPROFILE '.ngrok2\ngrok.yml'),
-        (Join-Path $env:USERPROFILE '.ngrok2\ngrok.yaml')
-    )
-    foreach ($p in $known) {
-        Add-UniqueExistingPath -List $paths -Path $p
-    }
-
-    # 5. MSIX packages may expose package-local state. Probe only package
-    # directories whose names contain "ngrok", not the whole Packages tree.
-    $packagesRoot = Join-Path $env:LOCALAPPDATA 'Packages'
-    if (Test-Path -LiteralPath $packagesRoot -PathType Container) {
-        try {
-            Get-ChildItem -LiteralPath $packagesRoot -Directory -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -match '(?i)ngrok' } |
-                ForEach-Object {
-                    try {
-                        Get-ChildItem -LiteralPath $_.FullName -File -Recurse -ErrorAction SilentlyContinue |
-                            Where-Object { $_.Name -match '(?i)^ngrok\.ya?ml$' } |
-                            ForEach-Object {
-                                Add-UniqueExistingPath -List $paths -Path $_.FullName
-                            }
-                    } catch {}
-                }
-        } catch {}
-    }
-
-    return @($paths.ToArray())
-}
-
-function Get-NgrokConfigPath {
-    $paths = @(Get-NgrokConfigPaths)
-    if ($paths.Count -gt 0) { return [string]$paths[0] }
-    return $null
-}
-
-function Read-TextFileAutoEncoding {
-    param([Parameter(Mandatory=$true)][string]$Path)
-
-    [byte[]]$bytes = [IO.File]::ReadAllBytes($Path)
-    if ($bytes.Length -eq 0) { return '' }
-
-    # BOM-aware decoding.
-    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
-        return [Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length - 3)
-    }
-    if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) {
-        return [Text.Encoding]::Unicode.GetString($bytes, 2, $bytes.Length - 2)
-    }
-    if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF) {
-        return [Text.Encoding]::BigEndianUnicode.GetString($bytes, 2, $bytes.Length - 2)
-    }
-
-    # Detect UTF-16 without BOM by the characteristic NUL-byte pattern.
-    $sampleLength = [Math]::Min($bytes.Length, 512)
-    $evenNulls = 0
-    $oddNulls = 0
-    for ($i = 0; $i -lt $sampleLength; $i++) {
-        if ($bytes[$i] -eq 0) {
-            if (($i % 2) -eq 0) { $evenNulls++ } else { $oddNulls++ }
-        }
-    }
-    if ($oddNulls -gt 4 -and $oddNulls -gt ($evenNulls * 2)) {
-        return [Text.Encoding]::Unicode.GetString($bytes)
-    }
-    if ($evenNulls -gt 4 -and $evenNulls -gt ($oddNulls * 2)) {
-        return [Text.Encoding]::BigEndianUnicode.GetString($bytes)
-    }
-
-    # ngrok itself writes UTF-8/ASCII on Windows.
-    try {
-        $strictUtf8 = New-Object Text.UTF8Encoding($false, $true)
-        return $strictUtf8.GetString($bytes)
-    } catch {
-        return [Text.Encoding]::Default.GetString($bytes)
-    }
-}
-
-function ConvertFrom-NgrokYamlScalar {
-    param([string]$Value)
-
-    if ($null -eq $Value) { return $null }
-    $v = $Value.Trim()
-    if (-not $v) { return $null }
-
-    if ($v.Length -ge 2 -and $v[0] -eq '"' -and $v[$v.Length - 1] -eq '"') {
-        return $v.Substring(1, $v.Length - 2)
-    }
-    if ($v.Length -ge 2 -and $v[0] -eq [char]39 -and $v[$v.Length - 1] -eq [char]39) {
-        return $v.Substring(1, $v.Length - 2)
-    }
-
-    # Remove a YAML comment only when separated from the value by whitespace.
-    $v = [regex]::Replace($v, '\s+#.*$', '').Trim()
-    if (-not $v) { return $null }
-
-    # Environment-variable references are valid YAML values too.
-    if ($v -match '^\$\{(?<name>[A-Za-z_][A-Za-z0-9_]*)\}$') {
-        $envValue = [Environment]::GetEnvironmentVariable($Matches['name'])
-        if (-not [string]::IsNullOrWhiteSpace($envValue)) { return $envValue }
-    }
-    if ($v -match '^\$(?<name>[A-Za-z_][A-Za-z0-9_]*)$') {
-        $envValue = [Environment]::GetEnvironmentVariable($Matches['name'])
-        if (-not [string]::IsNullOrWhiteSpace($envValue)) { return $envValue }
-    }
-
-    return $v
-}
-
-function Read-NgrokAuthtokenFromConfig {
-    param([Parameter(Mandatory=$true)][string]$Path)
-
-    try {
-        $text = Read-TextFileAutoEncoding -Path $Path
-    } catch {
+        Write-Warn ("Страница релиза недоступна: {0}" -f $_.Exception.Message)
         return $null
     }
+}
 
-    # Normal ngrok v2:
-    #   authtoken: TOKEN
-    #
-    # Normal ngrok v3:
-    #   agent:
-    #       authtoken: TOKEN
-    #
-    # Parse line-by-line first so indentation and the surrounding section do
-    # not matter.
-    foreach ($line in ($text -split '\r?\n')) {
-        $m = [regex]::Match(
-            [string]$line,
-            '^\s*(?:agent\.)?authtoken\s*:\s*(?<value>.*?)\s*$',
-            [Text.RegularExpressions.RegexOptions]::IgnoreCase
-        )
-        if ($m.Success) {
-            $token = ConvertFrom-NgrokYamlScalar -Value $m.Groups['value'].Value
-            if (-not [string]::IsNullOrWhiteSpace($token)) {
-                return $token
-            }
+function Get-LocalTunnelArchive {
+    param([string]$Arch)
+    $found = New-Object System.Collections.Generic.List[object]
+    foreach ($folder in @($ScriptDir,(Join-Path $ScriptDir 'tunnel-client-cache'))) {
+        if (-not (Test-Path -LiteralPath $folder -PathType Container)) { continue }
+        $sums = Join-Path $folder 'SHA256SUMS.txt'
+        if (-not (Test-Path -LiteralPath $sums -PathType Leaf)) { continue }
+        foreach ($archive in @(Get-ChildItem -LiteralPath $folder -Filter ("tunnel-client-v*-windows-{0}.zip" -f $Arch) -File -ErrorAction SilentlyContinue)) {
+            if ($archive.Name -notmatch '^tunnel-client-v([0-9]+\.[0-9]+\.[0-9]+)-windows-(amd64|arm64)\.zip$') { continue }
+            $v = [Version]$Matches[1]
+            if ($v -lt $MinTunnelClient) { continue }
+            $found.Add([pscustomobject]@{ Zip=$archive.FullName; Sums=$sums; FileName=$archive.Name; Version=$v })
         }
     }
+    return @($found | Sort-Object Version -Descending | Select-Object -First 1)
+}
 
-    # Defensive fallback for compact/inline YAML, for example:
-    # agent: { authtoken: TOKEN }
-    $inline = [regex]::Match(
-        $text,
-        '(?i)(?:^|[\{,]\s*)authtoken\s*:\s*(?<value>"[^"]*"|''[^'']*''|[^,\}\r\n]+)'
+function Get-TunnelArchiveHash {
+    param([string]$FileName,[string]$SumsPath)
+    $body = [IO.File]::ReadAllText($SumsPath,[Text.Encoding]::UTF8)
+    $pattern = '(?m)^([0-9a-fA-F]{64})\s+\*?' + [regex]::Escape($FileName) + '\s*$'
+    $match = [regex]::Match($body,$pattern)
+    if (-not $match.Success) { throw ("SHA256SUMS.txt не содержит {0}." -f $FileName) }
+    return $match.Groups[1].Value
+}
+
+function Ensure-TunnelClient {
+    Write-Step 'Secure MCP Tunnel: проверка tunnel-client'
+    $existing = Get-TunnelClientPath
+    if ($existing) {
+        $check = Test-TunnelClientBinary -Path $existing
+        if ($check.Compatible) {
+            $script:TunnelExe = $existing
+            Write-Ok ("tunnel-client {0}: {1}" -f $check.Version, $existing)
+            return
+        }
+        Write-Warn ("Найденный tunnel-client несовместим: {0}. Установлю официальный релиз." -f $check.Reason)
+    }
+    [Net.ServicePointManager]::SecurityProtocol = (
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
     )
-    if ($inline.Success) {
-        $token = ConvertFrom-NgrokYamlScalar -Value $inline.Groups['value'].Value
-        if (-not [string]::IsNullOrWhiteSpace($token)) {
-            return $token
-        }
-    }
-
-    return $null
-}
-
-function Get-NgrokAuthtokenValue {
-    if (-not [string]::IsNullOrWhiteSpace($env:NGROK_AUTHTOKEN)) {
-        return [string]$env:NGROK_AUTHTOKEN
-    }
-
-    foreach ($p in @(Get-NgrokConfigPaths)) {
-        $token = Read-NgrokAuthtokenFromConfig -Path $p
-        if (-not [string]::IsNullOrWhiteSpace($token)) {
-            $script:NgrokConfigPathHint = $p
-            return $token
-        }
-    }
-
-    return $null
-}
-
-function Test-NgrokConfigValid {
-    $check = Get-NgrokConfigCheckInfo
-    return ($check.ExitCode -eq 0)
-}
-
-function Get-NgrokAuthState {
-    for ($i = 0; $i -lt 6; $i++) {
-        $token = Get-NgrokAuthtokenValue
-        if (-not [string]::IsNullOrWhiteSpace($token)) {
-            return [pscustomobject]@{
-                Configured  = $true
-                Token       = $token
-                Readable    = $true
-                ConfigValid = $true
-                ConfigPath  = $script:NgrokConfigPathHint
+    Write-Info 'Загружаю последнюю версию с github.com/openai/tunnel-client.'
+    $arch = if ([Environment]::Is64BitOperatingSystem) { 'amd64' } else { throw 'Нужна 64-битная Windows.' }
+    if ($env:PROCESSOR_ARCHITECTURE -match 'ARM64' -or $env:PROCESSOR_ARCHITEW6432 -match 'ARM64') { $arch = 'arm64' }
+    $headers = @{ 'User-Agent'='DevSpace-Secure-Tunnel-Launcher'; 'Accept'='application/vnd.github+json' }
+    $release = Get-TunnelReleaseMetadata -Arch $arch
+    $asset = if ($release) { @($release.assets | Where-Object { $_.name -match ("^tunnel-client-v[0-9.]+-windows-{0}\.zip$" -f $arch) }) | Select-Object -First 1 } else { $null }
+    if (-not $asset) { Write-Warn 'Релиз для нужной архитектуры не найден; проверяю локальные архивы.' }
+    $folder = Join-Path $env:LOCALAPPDATA 'Programs\tunnel-client'
+    $temp = Join-Path $env:TEMP ('devspace-tunnel-install-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $temp -Force | Out-Null
+    try {
+        $zip = Join-Path $temp 'client.zip'
+        $expected = ''
+        $loaded = $false
+        if ($asset) {
+            try {
+                Write-Info ("Загружаю официальный tunnel-client: {0}" -f $asset.name)
+                Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zip -UseBasicParsing -Headers $headers -TimeoutSec 180
+                if ($asset.digest -and ([string]$asset.digest -match '^sha256:([0-9a-fA-F]{64})$')) {
+                    $expected = $Matches[1]
+                } else {
+                    $sums = @($release.assets | Where-Object { $_.name -eq 'SHA256SUMS.txt' }) | Select-Object -First 1
+                    if (-not $sums) { throw 'В релизе отсутствует SHA256SUMS.txt.' }
+                    $sumFile = Join-Path $temp 'SHA256SUMS.txt'
+                    Invoke-WebRequest -Uri $sums.browser_download_url -OutFile $sumFile -UseBasicParsing -Headers $headers -TimeoutSec 45
+                    $expected = Get-TunnelArchiveHash -FileName $asset.name -SumsPath $sumFile
+                }
+                $loaded = $true
+            } catch {
+                Write-Warn ("Автоматическая загрузка не удалась: {0}" -f $_.Exception.Message)
+                Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
             }
         }
-        if ($i -lt 5) { Start-Sleep -Milliseconds 200 }
+        if (-not $loaded) {
+            $offline = @(Get-LocalTunnelArchive -Arch $arch)
+            if ($offline.Count -eq 0) {
+                throw (
+                    'Не удалось скачать tunnel-client. Скачайте Windows ZIP и SHA256SUMS.txt одного релиза с ' +
+                    'https://github.com/openai/tunnel-client/releases/latest или ' +
+                    'https://platform.openai.com/settings/organization/tunnels. ' +
+                    'Положите оба файла рядом с CMD либо в папку tunnel-client-cache и повторите запуск.'
+                )
+            }
+            $selected = $offline[0]
+            Copy-Item -LiteralPath $selected.Zip -Destination $zip -Force
+            $expected = Get-TunnelArchiveHash -FileName $selected.FileName -SumsPath $selected.Sums
+            Write-Info ("Используется проверенный локальный архив: {0}" -f $selected.FileName)
+        }
+        $actual = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
+        if ($actual -ine $expected) { throw 'SHA256 архива tunnel-client не совпадает! Установка остановлена.' }
+        $extract = Join-Path $temp 'unpacked'
+        Expand-Archive -LiteralPath $zip -DestinationPath $extract -Force
+        $exe = Get-ChildItem -LiteralPath $extract -Filter 'tunnel-client.exe' -File -Recurse | Select-Object -First 1
+        if (-not $exe) { throw 'В официальном ZIP не найден tunnel-client.exe.' }
+        $archiveBinary = Test-TunnelClientBinary -Path $exe.FullName
+        if (-not $archiveBinary.Compatible) { throw ("В архиве несовместимый tunnel-client: {0}" -f $archiveBinary.Reason) }
+        New-Item -ItemType Directory -Path $folder -Force | Out-Null
+        $dest = Join-Path $folder 'tunnel-client.exe'
+        Copy-Item -LiteralPath $exe.FullName -Destination $dest -Force
+        Unblock-File -LiteralPath $dest -ErrorAction SilentlyContinue
+        $installed = Test-TunnelClientBinary -Path $dest
+        if (-not $installed.Compatible) { throw ("Установленный tunnel-client несовместим: {0}" -f $installed.Reason) }
+        $script:TunnelExe = $dest
+        Write-Ok ("Официальный tunnel-client {0} установлен; SHA256 проверен." -f $installed.Version)
+    } finally { Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+function Get-RuntimeKeyFromFile {
+    param([Parameter(Mandatory=$true)][string]$Path)
+    $full = [Environment]::ExpandEnvironmentVariables($Path.Trim().Trim('"'))
+    if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { throw "Файл с ключом не найден: $full" }
+    $raw = [IO.File]::ReadAllText($full).Trim()
+    if ($raw.StartsWith('{')) {
+        $j = $raw | ConvertFrom-Json
+        foreach ($name in @('CONTROL_PLANE_API_KEY','control_plane_api_key','runtime_api_key','api_key')) {
+            $prop = $j.PSObject.Properties[$name]
+            if ($prop -and $prop.Value) { return [string]$prop.Value }
+        }
+        throw 'JSON не содержит CONTROL_PLANE_API_KEY или runtime_api_key.'
     }
+    $match = [regex]::Match($raw, '(?im)^\s*(?:export\s+|set\s+)?CONTROL_PLANE_API_KEY\s*=\s*["'']?(?<key>[^\r\n"'']+)["'']?\s*$')
+    if ($match.Success) { return $match.Groups['key'].Value.Trim() }
+    if ($raw -match '[\r\n]') { throw 'Не найден CONTROL_PLANE_API_KEY=... в многострочном файле.' }
+    return $raw.Trim([char]34, [char]39)
+}
 
-    $check = Get-NgrokConfigCheckInfo
-    return [pscustomobject]@{
-        Configured  = $false
-        Token       = $null
-        Readable    = $false
-        ConfigValid = ($check.ExitCode -eq 0)
-        ConfigPath  = $check.Path
+# Persistent DevSpace credentials and tunnel registration data are held only in
+# the .env next to this CMD. Do not read/write the Windows User or Machine
+# environment. tunnel-client still needs a temporary child process environment.
+function Get-DotEnvValue {
+    param([Parameter(Mandatory=$true)][string]$Name)
+    if (-not (Test-Path -LiteralPath $DotEnvPath -PathType Leaf)) { return '' }
+    $matcher = '^\s*(?:export\s+)?' + [regex]::Escape($Name) + '\s*=(.*)$'
+    $result = ''
+    foreach ($line in [IO.File]::ReadAllLines($DotEnvPath, [Text.Encoding]::UTF8)) {
+        $match = [regex]::Match($line, $matcher)
+        if (-not $match.Success) { continue }
+        $value = $match.Groups[1].Value.Trim()
+        if ($value.Length -ge 2 -and (
+            ($value.StartsWith('"') -and $value.EndsWith('"')) -or
+            ($value.StartsWith("'") -and $value.EndsWith("'")))) {
+            $value = $value.Substring(1, $value.Length-2)
+        }
+        $result = $value
     }
+    return $result
 }
 
-function Test-NgrokAuthtokenConfigured {
-    return [bool](Get-NgrokAuthState).Configured
-}
-
-function Get-MaskedSecret {
-    param([string]$Value)
-    if ([string]::IsNullOrWhiteSpace($Value)) { return '(не настроен)' }
-    if ($Value.Length -le 10) { return ('*' * $Value.Length) }
-    return $Value.Substring(0,5) + ('*' * [Math]::Max(6, $Value.Length - 10)) + $Value.Substring($Value.Length - 5)
-}
-
-function Set-NgrokAuthtokenValue {
-    param([Parameter(Mandatory=$true)][string]$Token)
-
-    $plain = $Token.Trim()
-    if ([string]::IsNullOrWhiteSpace($plain)) { throw 'Authtoken не введён.' }
-
+function Save-DotEnvValue {
+    param([Parameter(Mandatory=$true)][string]$Name,
+          [Parameter(Mandatory=$true)][string]$Value)
+    if ($Name -notmatch '^[A-Z][A-Z0-9_]*$') { throw 'Некорректное имя параметра .env.' }
+    if ($Value -match '[\r\n]') { throw 'Значения .env не могут содержать перевод строки.' }
+    if ($Value -match '\s' -or $Value -match '["'']') { throw 'Значение .env содержит недопустимый символ.' }
+    # Keep other lines/comments in an existing .env (including unrelated keys).
+    $lines = New-Object System.Collections.Generic.List[string]
+    if (Test-Path -LiteralPath $DotEnvPath -PathType Leaf) {
+        foreach ($line in [IO.File]::ReadAllLines($DotEnvPath, [Text.Encoding]::UTF8)) {
+            $lines.Add($line)
+        }
+    } else {
+        $lines.Add('# DevSpace Secure MCP Tunnel — local configuration; DO NOT COMMIT')
+        $lines.Add('# API keys are stored as plaintext. Keep this .env private.')
+    }
+    $matcher = '^\s*(?:export\s+)?' + [regex]::Escape($Name) + '\s*='
+    $output = New-Object System.Collections.Generic.List[string]
+    $written = $false
+    foreach ($line in $lines) {
+        if ([regex]::IsMatch($line, $matcher)) {
+            if (-not $written) { $output.Add($Name + '=' + $Value); $written = $true }
+        } else { $output.Add($line) }
+    }
+    if (-not $written) { $output.Add($Name + '=' + $Value) }
+    $tempFile = Join-Path $ScriptDir ('.env.tmp.' + [guid]::NewGuid().ToString('N'))
+    $backupFile = Join-Path $ScriptDir ('.env.bak.' + [guid]::NewGuid().ToString('N'))
+    $replacedExisting = $false
     try {
-        # Show ngrok's own result, but capture it as well so we can remember the
-        # exact configuration file it wrote.
-        $r = Invoke-Native -FilePath $script:NgrokExe -Arguments @('config','add-authtoken',$plain) -AllowFailure
+        [IO.File]::WriteAllText($tempFile, (($output.ToArray() -join "`r`n") + "`r`n"), (New-Object Text.UTF8Encoding($false)))
+        if (Test-Path -LiteralPath $DotEnvPath -PathType Leaf) {
+            # On Windows PowerShell / .NET Framework, a null backup path may
+            # produce 'The path is not of a legal form.' Use a real backup path.
+            # Replace is atomic on NTFS and preserves the destination ACL.
+            [IO.File]::Replace($tempFile, $DotEnvPath, $backupFile)
+            $replacedExisting = $true
+        } else {
+            [IO.File]::Move($tempFile, $DotEnvPath)
+            # Best effort: give the current user exclusive ACL on a new secret file.
+            try {
+                $acl = Get-Acl -LiteralPath $DotEnvPath
+                $acl.SetAccessRuleProtection($true,$false)
+                $identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+                $rule = [Security.AccessControl.FileSystemAccessRule]::new($identity, [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow)
+                [void]$acl.AddAccessRule($rule)
+                Set-Acl -LiteralPath $DotEnvPath -AclObject $acl -ErrorAction Stop
+            } catch {
+                Write-Warn 'Не удалось ограничить права на .env автоматически; проверьте права доступа к файлу.'
+            }
+        }
     } finally {
-        $plain = $null
+        if (Test-Path -LiteralPath $tempFile) {
+            Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
+        }
+        # Delete the backup only after a successful atomic replacement.
+        if ($replacedExisting -and (Test-Path -LiteralPath $backupFile)) {
+            Remove-Item -LiteralPath $backupFile -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Write-Ok ('Сохранён {0} в {1}.' -f $Name, $DotEnvPath)
+}
+
+function Read-VisibleKey {
+    param([Parameter(Mandatory=$true)][string]$Prompt)
+    # Echo typed/pasted keys in the console, as requested. Temporarily suspend
+    # Start-Transcript so the plaintext secret is NOT copied to launcher logs.
+    return (Read-HostWithoutTranscript -Prompt $Prompt)
+}
+
+function Get-KeyFingerprint {
+    param([string]$Key)
+    if ([string]::IsNullOrWhiteSpace($Key)) { return '' }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [Text.Encoding]::UTF8.GetBytes($Key)
+        $hash = $sha.ComputeHash($bytes)
+        return ([BitConverter]::ToString($hash).Replace('-', '').ToLowerInvariant())
+    } finally { $sha.Dispose() }
+}
+
+function Format-MaskedApiKey {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return '(не задан)' }
+    $valueText = $Value.Trim()
+    # Show only the first 17 and last 8 characters of a saved key.
+    if ($valueText.Length -ge 30) {
+        return ($valueText.Substring(0,17) + '***' + $valueText.Substring($valueText.Length-8))
+    }
+    if ($valueText.Length -ge 12) {
+        return ($valueText.Substring(0,5) + '***' + $valueText.Substring($valueText.Length-4))
+    }
+    if ($valueText.Length -ge 5) {
+        return ($valueText.Substring(0,2) + '***' + $valueText.Substring($valueText.Length-2))
+    }
+    return '***'
+}
+
+function Show-RuntimeKeyHelp {
+    Write-NoticeBox -Title 'ПОДСКАЗКА — КЛЮЧ ДЛЯ РАБОТЫ ТУННЕЛЕЙ' -Lines @(
+        'CONTROL_PLANE_API_KEY — Runtime API key для tunnel-client.',
+        'Где получить: https://platform.openai.com/settings/organization/api-keys',
+        'Выберите Restricted и разрешения Tunnels Read + Use.',
+        'Для создания туннеля требуется отдельный Admin API key.',
+        'Ключ хранится в .env рядом с CMD, НЕ в переменных Windows.'
+    )
+}
+
+function Show-AdminKeyHelp {
+    Write-NoticeBox -Title 'ПОДСКАЗКА — КЛЮЧ ДЛЯ СОЗДАНИЯ ТУННЕЛЕЙ' -Lines @(
+        'OPENAI_ADMIN_KEY — отдельный Admin API key для регистрации.',
+        'Где получить: https://platform.openai.com/settings/organization/admin-keys',
+        'Для создания туннеля нужны права Tunnels Read + Manage.',
+        'Runtime key (sk-proj-...) не заменяет Admin API key.',
+        'Admin key при запуске готового туннеля НЕ используется.',
+        'Ключ хранится в .env рядом с CMD, НЕ в переменных Windows.'
+    )
+}
+
+function Resolve-SharedRuntimeKey {
+    param($Settings)
+    Write-Rule 'OPENAI SECURE MCP TUNNEL — API-КЛЮЧ'
+    Show-RuntimeKeyHelp
+    $old = Get-DotEnvValue -Name 'CONTROL_PLANE_API_KEY'
+    if ($old) {
+        Write-SavedAccent ('Найден сохраненный CONTROL_PLANE_API_KEY: {0}.' -f (Format-MaskedApiKey -Value $old))
+        Write-SavedAccent 'Enter — оставить; R — заменить; B — назад.'
+        while ($true) {
+            $choice = (Read-HostWithoutTranscript 'Ключ').Trim()
+            if ($choice -eq '' -or $choice -match '^(?i:k|keep)$') {
+                $script:RuntimeKey = $old
+                Write-Ok 'Используется Runtime API key из локального .env.'
+                return $true
+            }
+            if ($choice -match '^(?i:b|back|назад)$') { return $false }
+            if ($choice -match '^(?i:r|replace|з|заменить)$') { break }
+            Write-Warn 'Выберите Enter, R или B.'
+        }
+    } else {
+        Write-Warn 'В локальном .env нет CONTROL_PLANE_API_KEY.'
+        Write-Info 'Введите Runtime API key, он сохранится только в .env рядом с CMD.'
+    }
+    while ($true) {
+        $newKey = Read-VisibleKey -Prompt 'Runtime API key (Enter = отмена)'
+        if (-not $newKey) { return $false }
+        if ($newKey -match '\s') { Write-Warn 'В ключе не должно быть пробелов или переносов строк.'; continue }
+        if ($old -and $newKey -cne $old) { $script:RuntimeKeyChanged = $true }
+        Save-DotEnvValue -Name 'CONTROL_PLANE_API_KEY' -Value $newKey
+        $script:RuntimeKey = $newKey
+        Write-Ok 'Runtime API key сохранён в .env.'
+        return $true
+    }
+}
+
+function Get-JsonField {
+    param($Value, [Parameter(Mandatory=$true)][string]$Name)
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [System.Collections.IDictionary]) {
+        if ($Value.Contains($Name)) { return $Value[$Name] }
+        return $null
+    }
+    $property = $Value.PSObject.Properties[$Name]
+    if ($null -ne $property) { return $property.Value }
+    return $null
+}
+
+function ConvertFrom-NativeJson {
+    param([string]$Output)
+    if (-not $Output) { return $null }
+    # Prefer the full JSON response. Do not scrape arbitrary output for secrets.
+    try { return ($Output | ConvertFrom-Json -ErrorAction Stop) } catch { return $null }
+}
+
+function Get-UniqueTunnelIdsFromOutput {
+    param([string]$Output)
+    # Used only on a CLI response that has already been scoped to one DevSpace alias.
+    return @([regex]::Matches([string]$Output, 'tunnel_[A-Za-z0-9_-]+') |
+        ForEach-Object { $_.Value } | Select-Object -Unique)
+}
+
+function Read-DevSpaceTunnelIdFromNativeState {
+    # Check the local alias first: status is scoped to devspace-mcp, so a unique
+    # tunnel ID anywhere in this command's JSON is safe to adopt.
+    $found = Invoke-Native -FilePath $script:TunnelExe -Arguments @('runtimes','status','devspace-mcp','--json') -Quiet -AllowFailure
+    if ($found.ExitCode -eq 0) {
+        $ids = @(Get-UniqueTunnelIdsFromOutput -Output $found.Output)
+        if ($ids.Count -eq 1) { return [string]$ids[0] }
+        if ($ids.Count -gt 1) { Write-Warn 'У alias devspace-mcp несколько разных ID; автоматический выбор небезопасен.' }
     }
 
+    $listed = Invoke-Native -FilePath $script:TunnelExe -Arguments @('runtimes','list','--json') -Quiet -AllowFailure
+    if ($listed.ExitCode -ne 0) { return '' }
+    $j = ConvertFrom-NativeJson -Output $listed.Output
+    if ($null -eq $j) { return '' }
+    $entries = New-Object System.Collections.Generic.List[object]
+    foreach ($root in @($j)) { if ($null -ne $root) { $entries.Add($root) } }
+    foreach ($property in @('aliases','local_aliases','runtimes','local','entries','items')) {
+        $group = Get-JsonField -Value $j -Name $property
+        if ($null -eq $group) { continue }
+        $namedEntry = Get-JsonField -Value $group -Name 'devspace-mcp'
+        if ($null -ne $namedEntry) { $entries.Add($namedEntry) }
+        foreach ($entry in @($group)) { if ($null -ne $entry) { $entries.Add($entry) } }
+    }
+    $candidates = New-Object System.Collections.Generic.List[string]
+    foreach ($entry in $entries) {
+        $alias = Get-JsonField -Value $entry -Name 'alias'
+        if ($alias -ne 'devspace-mcp') { continue }
+        $ids = @(Get-UniqueTunnelIdsFromOutput -Output ($entry | ConvertTo-Json -Depth 12 -Compress))
+        foreach ($id in $ids) { if (-not $candidates.Contains([string]$id)) { $candidates.Add([string]$id) } }
+    }
+    if ($candidates.Count -eq 1) { return [string]$candidates[0] }
+    if ($candidates.Count -gt 1) { Write-Warn 'В локальном состоянии DevSpace обнаружены противоречивые Tunnel ID.' }
+    return ''
+}
+
+function Save-DevSpaceTunnelId {
+    param($Settings, [Parameter(Mandatory=$true)][string]$TunnelId)
+    if ($TunnelId -notmatch '^tunnel_[A-Za-z0-9_-]+$') { throw 'Некорректный Tunnel ID от tunnel-client.' }
+    $Settings.TunnelId = $TunnelId
+    # Store ONLY fingerprints. Never store API keys in settings.json.
+    $Settings.RuntimeKeyFingerprint = Get-KeyFingerprint -Key $script:RuntimeKey
+    if ($script:SelectedAdminKey) {
+        $Settings.AdminKeyFingerprint = Get-KeyFingerprint -Key $script:SelectedAdminKey
+    }
+    Save-Settings $Settings
+    Save-DotEnvValue -Name 'DEVSPACE_MCP_TUNNEL_ID' -Value $TunnelId
+}
+
+function Get-ScopeFromLocalRuntimes {
+    # Scope can be learned from tunnel metadata using only a Runtime key.
+    # Never infer the scope from the key itself and never reuse another tunnel ID.
+    $scopeMatches = New-Object System.Collections.Generic.List[object]
+    $oldRuntime = [Environment]::GetEnvironmentVariable('CONTROL_PLANE_API_KEY','Process')
+    $oldAdmin = [Environment]::GetEnvironmentVariable('OPENAI_ADMIN_KEY','Process')
+    try {
+        [Environment]::SetEnvironmentVariable('CONTROL_PLANE_API_KEY', $script:RuntimeKey, 'Process')
+        $result = Invoke-Native -FilePath $script:TunnelExe -Arguments @('runtimes','list','--json') -Quiet -AllowFailure
+        if ($result.ExitCode -ne 0) { return $null }
+        $allIds = [regex]::Matches([string]$result.Output, 'tunnel_[A-Za-z0-9_-]+') |
+            ForEach-Object { $_.Value } | Select-Object -Unique -First 8
+        # The read-only get command should use the runtime credential, not a
+        # potentially unrelated admin key present in this PowerShell process.
+        [Environment]::SetEnvironmentVariable('OPENAI_ADMIN_KEY', $null, 'Process')
+        foreach ($tid in @($allIds)) {
+            if ($tid -notmatch '^tunnel_[A-Za-z0-9_-]+$') { continue }
+            $r = Invoke-Native -FilePath $script:TunnelExe -Arguments @('admin','tunnels','get',$tid,'--json') -Quiet -AllowFailure
+            if ($r.ExitCode -ne 0) { continue }
+            $info = ConvertFrom-NativeJson -Output $r.Output
+            if ($null -eq $info) { continue }
+            $orgs = @(Get-JsonField -Value $info -Name 'organization_ids' | Where-Object { $_ })
+            $workspaces = @(Get-JsonField -Value $info -Name 'workspace_ids' | Where-Object { $_ })
+            if ($orgs.Count -eq 1 -or $workspaces.Count -eq 1) {
+                $org = if ($orgs.Count -eq 1) { [string]$orgs[0] } else { '' }
+                $ws = if ($workspaces.Count -eq 1) { [string]$workspaces[0] } else { '' }
+                if ($org -or $ws) {
+                    $key = ($org + '|' + $ws)
+                    if (@($scopeMatches | Where-Object { $_.Key -eq $key }).Count -eq 0) {
+                        $scopeMatches.Add([pscustomobject]@{ Key=$key; Org=$org; Workspace=$ws })
+                    }
+                }
+            }
+        }
+    } finally {
+        [Environment]::SetEnvironmentVariable('CONTROL_PLANE_API_KEY', $oldRuntime, 'Process')
+        [Environment]::SetEnvironmentVariable('OPENAI_ADMIN_KEY', $oldAdmin, 'Process')
+    }
+    if ($scopeMatches.Count -eq 1) {
+        $item = $scopeMatches[0]
+        Write-Ok 'Организация/workspace определены по метаданным другого локального туннеля.'
+        return $item
+    }
+    if ($scopeMatches.Count -gt 1) {
+        Write-Info 'У локальных туннелей разные области доступа. Выберите нужную для DevSpace:'
+        for ($i=0; $i -lt $scopeMatches.Count; $i++) {
+            Write-Host ("  [{0}] Организация: {1}; Workspace: {2}" -f ($i+1), $scopeMatches[$i].Org, $scopeMatches[$i].Workspace) -ForegroundColor Cyan
+        }
+        Write-Host '  [M] Указать другую область вручную' -ForegroundColor Gray
+        while ($true) {
+            $choice = (Read-HostWithoutTranscript 'Область').Trim()
+            if ($choice -eq '' -or $choice -match '^(?i:m)$') { return $null }
+            $index = 0
+            if ([int]::TryParse($choice, [ref]$index) -and $index -ge 1 -and $index -le $scopeMatches.Count) {
+                return $scopeMatches[$index-1]
+            }
+            Write-Warn 'Выберите номер области или M.'
+        }
+    }
+    return $null
+}
+
+function Resolve-RegistrationScope {
+    if ($script:NewAccountBinding) {
+        $org = ''
+        $workspace = ''
+        Write-Warn 'Выбран другой аккаунт OpenAI: старые Organization/Workspace ID не используются.'
+    } else {
+        $org = Get-DotEnvValue -Name 'OPENAI_ORG_ID'
+        $workspace = Get-DotEnvValue -Name 'OPENAI_WORKSPACE_ID'
+    }
+    if ($org -or $workspace) {
+        Write-Ok 'Scope регистрации найден в локальном .env.'
+        return [pscustomobject]@{ Org=$org; Workspace=$workspace }
+    }
+    if (-not $script:NewAccountBinding) {
+        Write-Info 'Проверяю scope по уже настроенным локальным туннелям.'
+        $discovered = Get-ScopeFromLocalRuntimes
+        if ($discovered) {
+            if ($discovered.Org) { Save-DotEnvValue -Name 'OPENAI_ORG_ID' -Value $discovered.Org }
+            if ($discovered.Workspace) { Save-DotEnvValue -Name 'OPENAI_WORKSPACE_ID' -Value $discovered.Workspace }
+            return $discovered
+        }
+    }
+    Write-NoticeBox -Title 'ПЕРВАЯ РЕГИСТРАЦИЯ ТУННЕЛЯ: ОБЛАСТЬ ДОСТУПА' -Lines @(
+        'Scope — ID организации или ChatGPT workspace, НЕ API-ключ.',
+        'Без scope невозможно создать новый туннель.',
+        'Организация: https://platform.openai.com/settings/organization/general',
+        'Workspace: настройки рабочего пространства ChatGPT.',
+        'Укажите хотя бы одно значение; оно сохранится в .env.',
+        'Чтобы отменить настройку, введите B.'
+    )
+    while ($true) {
+        $org = (Read-HostWithoutTranscript 'Organization ID (Enter = пропустить, B = назад)').Trim()
+        if ($org -match '^(?i:b|back|назад)$') { return $null }
+        $workspace = (Read-HostWithoutTranscript 'Workspace ID (Enter = пропустить, B = назад)').Trim()
+        if ($workspace -match '^(?i:b|back|назад)$') { return $null }
+        if (-not $org -and -not $workspace) { Write-Warn 'Укажите хотя бы один ID организации или workspace.'; continue }
+        if ($org -match '\s' -or $workspace -match '\s') { Write-Warn 'ID не должен содержать пробелы.'; continue }
+        # Save both fields, including empty values, so switching accounts
+        # cannot leave the previous account's workspace/org behind.
+        Save-DotEnvValue -Name 'OPENAI_ORG_ID' -Value $org
+        Save-DotEnvValue -Name 'OPENAI_WORKSPACE_ID' -Value $workspace
+        return [pscustomobject]@{ Org=$org; Workspace=$workspace }
+    }
+}
+
+function Resolve-AdminCreateKey {
+    param([switch]$RequireReplacement, [switch]$Optional)
+    $existing = Get-DotEnvValue -Name 'OPENAI_ADMIN_KEY'
+    if ($existing) {
+        Write-SavedAccent ('Найден сохраненный OPENAI_ADMIN_KEY: {0}.' -f (Format-MaskedApiKey -Value $existing))
+        if ($RequireReplacement) {
+            Write-Warn 'Предыдущая попытка отклонена. Введите другой Admin API key или отмените.'
+        } else {
+            Write-SavedAccent 'Enter — оставить; R — заменить; B — назад.'
+            while ($true) {
+                $choice = (Read-HostWithoutTranscript 'Admin API key').Trim()
+                if ($choice -eq '') { return $existing }
+                if ($choice -match '^(?i:b|back|назад)$') {
+                    $script:AdminSelectionBack = $true
+                    return ''
+                }
+                if ($choice -match '^(?i:r|replace|з|заменить)$') { break }
+                Write-Warn 'Выберите Enter, R или B.'
+            }
+        }
+    } else {
+        Write-Warn 'В локальном .env нет OPENAI_ADMIN_KEY.'
+        if ($Optional) {
+            Write-Info 'Для уже существующего туннеля admin-ключ необязателен.'
+            Write-SavedAccent 'Enter — пропустить; R — ввести ключ; B — назад.'
+            while ($true) {
+                $choice = (Read-HostWithoutTranscript 'Admin API key').Trim()
+                if ($choice -eq '') { return '' }
+                if ($choice -match '^(?i:b|back|назад)$') {
+                    $script:AdminSelectionBack = $true
+                    return ''
+                }
+                if ($choice -match '^(?i:r|replace|з|заменить)$') { break }
+                Write-Warn 'Выберите Enter, R или B.'
+            }
+        } else {
+            Write-Info 'Для создания нового туннеля введите Admin API key.'
+        }
+    }
+    while ($true) {
+        $newKey = Read-VisibleKey -Prompt 'Новый Admin API key (Enter = отмена)'
+        if (-not $newKey) { return '' }
+        if ($newKey -match '\s') { Write-Warn 'В ключе не должно быть пробелов или переносов строк.'; continue }
+        if ($existing -and $newKey -ceq $existing -and $RequireReplacement) {
+            Write-Warn 'Это тот же отклонённый ключ. Введите другой или отмените.'
+            continue
+        }
+        if ($existing -and $newKey -cne $existing) { $script:AdminKeyChanged = $true }
+        Save-DotEnvValue -Name 'OPENAI_ADMIN_KEY' -Value $newKey
+        return $newKey
+    }
+}
+
+function Invoke-DevSpaceAdminCommand {
+    param(
+        [Parameter(Mandatory=$true)][string]$ApiKey,
+        [Parameter(Mandatory=$true)][string[]]$CliArguments
+    )
+    # Never pass the admin key as a command-line argument or log its value.
+    # The process environment is restored as soon as tunnel-client exits.
+    $temporaryName = 'DEVSPACE_TUNNEL_CREATE_KEY'
+    $previous = [Environment]::GetEnvironmentVariable($temporaryName,'Process')
+    try {
+        [Environment]::SetEnvironmentVariable($temporaryName,$ApiKey,'Process')
+        $args = @('admin','--json','tunnels') + $CliArguments + @('--admin-key','env:DEVSPACE_TUNNEL_CREATE_KEY')
+        return (Invoke-Native -FilePath $script:TunnelExe -Arguments $args -Quiet -AllowFailure)
+    } finally {
+        [Environment]::SetEnvironmentVariable($temporaryName,$previous,'Process')
+    }
+}
+
+function Invoke-ListDevSpaceTunnels {
+    param([Parameter(Mandatory=$true)][string]$ApiKey, $Scope)
+    # The admin list endpoint requires EXACTLY one scope flag. Do not pass both.
+    $args = @('list')
+    if ($Scope.Org) { $args += @('--organization-id',[string]$Scope.Org) }
+    elseif ($Scope.Workspace) { $args += @('--workspace-id',[string]$Scope.Workspace) }
+    else { throw 'Для просмотра списка туннелей необходим scope организации/workspace.' }
+
+    $r = Invoke-DevSpaceAdminCommand -ApiKey $ApiKey -CliArguments $args
+    $found = New-Object System.Collections.Generic.List[object]
     if ($r.ExitCode -ne 0) {
-        throw "ngrok config add-authtoken завершился с кодом $($r.ExitCode)."
+        return [pscustomobject]@{ Success=$false; Tunnels=@(); Output=[string]$r.Output }
     }
+    $data = ConvertFrom-NativeJson -Output $r.Output
+    if ($null -eq $data) {
+        return [pscustomobject]@{ Success=$false; Tunnels=@(); Output='Невозможно разобрать JSON списка туннелей.' }
+    }
+    $items = Get-JsonField -Value $data -Name 'tunnels'
+    if ($null -eq $items -and $data -is [array]) { $items = $data }
+    foreach ($t in @($items)) {
+        if ($null -eq $t) { continue }
+        $name = [string](Get-JsonField -Value $t -Name 'name')
+        $id = [string](Get-JsonField -Value $t -Name 'id')
+        if ($name -eq 'DevSpace MCP' -and $id -match '^tunnel_[A-Za-z0-9_-]+$') {
+            $found.Add([pscustomobject]@{ Id=$id; Name=$name })
+        }
+    }
+    return [pscustomobject]@{ Success=$true; Tunnels=@($found.ToArray()); Output='' }
+}
 
-    foreach ($line in ($r.Output -split '\r?\n')) {
-        $clean = [regex]::Replace([string]$line, "$([char]27)\[[0-9;?]*[ -/]*[@-~]", '')
-        $m = [regex]::Match($clean, '(?i)(?<path>[A-Za-z]:\\.*?\.ya?ml)(?:"|''|\s|$)')
-        if ($m.Success) {
-            $candidate = $m.Groups['path'].Value.Trim()
-            if (Test-Path -LiteralPath $candidate -PathType Leaf) {
-                $script:NgrokConfigPathHint = (Resolve-Path -LiteralPath $candidate).Path
+function Select-DevSpaceRemoteTunnelId {
+    param($Snapshot)
+    $matches = @($Snapshot.Tunnels)
+    if ($matches.Count -eq 0) { return '' }
+    if ($matches.Count -eq 1) {
+        Write-Ok 'Нашёл ранее зарегистрированный DevSpace MCP в OpenAI; создание нового туннеля не требуется.'
+        return [string]$matches[0].Id
+    }
+    Write-Warn 'Найдено несколько DevSpace MCP с одинаковым названием. Новый туннель не создаю.'
+    for ($i=0; $i -lt $matches.Count; $i++) {
+        Write-Host ('  [{0}] {1}' -f ($i+1), $matches[$i].Id) -ForegroundColor Cyan
+    }
+    Write-Host '  [B] Вернуться в меню без изменений' -ForegroundColor Gray
+    while ($true) {
+        $choice = (Read-HostWithoutTranscript 'Выбери существующий DevSpace Tunnel ID').Trim()
+        if ($choice -eq '' -or $choice -match '^(?i:b|back|назад)$') { return '' }
+        $index = 0
+        if ([int]::TryParse($choice,[ref]$index) -and $index -ge 1 -and $index -le $matches.Count) {
+            return [string]$matches[$index-1].Id
+        }
+        Write-Warn 'Введите номер найденного туннеля или B.'
+    }
+}
+
+function Invoke-CreateDevSpaceTunnel {
+    param([Parameter(Mandatory=$true)][string]$ApiKey, $Scope)
+    # Direct admin CRUD returns the tunnel object with a top-level `id`.
+    # The previous `runtimes create` returned a different nested shape that
+    # wasn't handled by the launcher, even when it did create the tunnel.
+    $args = @('create','--name','DevSpace MCP',
+        '--description','Private DevSpace MCP via Secure MCP Tunnel')
+    if ($Scope.Org) { $args += @('--organization-id',[string]$Scope.Org) }
+    if ($Scope.Workspace) { $args += @('--workspace-id',[string]$Scope.Workspace) }
+    return (Invoke-DevSpaceAdminCommand -ApiKey $ApiKey -CliArguments $args)
+}
+
+function Resolve-OrCreateDevSpaceTunnelId {
+    param($Settings)
+    Write-Step 'Secure MCP Tunnel: поиск или создание ID для DevSpace'
+    Show-AdminKeyHelp
+    # Prompt for the admin key EVEN IF a tunnel ID already exists. The owner
+    # can switch accounts/keys from the wizard without editing any script.
+    $script:AdminSelectionBack = $false
+    $script:SelectedAdminKey = Resolve-AdminCreateKey -Optional
+    if ($script:AdminSelectionBack) { return '' }
+
+    $id = ''
+    foreach ($candidate in @((Get-DotEnvValue -Name 'DEVSPACE_MCP_TUNNEL_ID'), [string]$Settings.TunnelId)) {
+        if ($candidate -match '^tunnel_[A-Za-z0-9_-]+$') { $id = [string]$candidate; break }
+    }
+    # On an account switch, native client state may belong to the old owner.
+    if (-not $id) { $id = Read-DevSpaceTunnelIdFromNativeState }
+
+    $runtimeFingerprint = Get-KeyFingerprint -Key $script:RuntimeKey
+    $adminFingerprint = Get-KeyFingerprint -Key $script:SelectedAdminKey
+    $fingerprintChanged = $false
+    if ($Settings.RuntimeKeyFingerprint -and ($Settings.RuntimeKeyFingerprint -cne $runtimeFingerprint)) { $fingerprintChanged = $true }
+    if ($Settings.AdminKeyFingerprint -and $script:SelectedAdminKey -and ($Settings.AdminKeyFingerprint -cne $adminFingerprint)) { $fingerprintChanged = $true }
+    if ($script:RuntimeKeyChanged -or $script:AdminKeyChanged) { $fingerprintChanged = $true }
+    # Old versions did not store key fingerprints. Confirm the first reuse once.
+    $unverifiedBinding = ($id -and -not $Settings.RuntimeKeyFingerprint)
+    if ($id -and ($fingerprintChanged -or $unverifiedBinding)) {
+        Write-NoticeBox -Title 'ПРОВЕРКА АККАУНТА ДЛЯ DEVSPACE TUNNEL ID' -Lines @(
+            'Сохранённый Tunnel ID может относиться к другому аккаунту OpenAI.',
+            'Enter — тот же аккаунт: оставить существующий Tunnel ID.',
+            'N — другой аккаунт: найти или создать отдельный туннель.',
+            'B — вернуться в меню без подключения.',
+            'При N старый туннель НЕ удаляется. .env относится только к DevSpace.'
+        )
+        while ($true) {
+            $answer = (Read-HostWithoutTranscript 'Аккаунт [Enter/N/B]').Trim()
+            if ($answer -eq '') { break }
+            if ($answer -match '^(?i:b|back|назад)$') { return '' }
+            if ($answer -match '^(?i:n|new|новый)$') {
+                $script:NewAccountBinding = $true
+                $id = ''
                 break
             }
+            Write-Warn 'Выберите Enter, N или B.'
         }
     }
-
-    $authState = Get-NgrokAuthState
-    if (-not $authState.Readable) {
-        $where = if ($authState.ConfigPath) { $authState.ConfigPath } else { '(путь не определён)' }
-        throw ("ngrok сообщил об успешном сохранении Authtoken, но launcher не смог прочитать ключ authtoken из активного файла конфигурации: {0}. Это внутренняя ошибка чтения конфигурации, запуск не будет молча продолжен." -f $where)
+    if (-not $script:NewAccountBinding -and $id) {
+        Write-Ok "Найден существующий DevSpace Tunnel ID: $id"
+        Save-DevSpaceTunnelId -Settings $Settings -TunnelId $id
+        return $id
+    }
+    if ($script:NewAccountBinding) {
+        Write-Info 'Аккаунт переключён: старый DevSpace Tunnel ID не используется.'
     }
 
-    Write-Ok ('Authtoken сохранён: {0}' -f (Get-MaskedSecret $authState.Token))
+    $scope = Resolve-RegistrationScope
+    if (-not $scope) { return '' }
+    $admin = $script:SelectedAdminKey
+    if (-not $admin) {
+        Write-Info 'Для поиска или создания туннеля нового аккаунта нужен Admin API key.'
+        $script:AdminSelectionBack = $false
+        $admin = Resolve-AdminCreateKey
+        if ($script:AdminSelectionBack -or -not $admin) { return '' }
+        $script:SelectedAdminKey = $admin
+    }
+
+    # An earlier version reported 'created, but ID could not be extracted'.
+    # REMOTE READ FIRST, including on a clean installation. Never create a new
+    # tunnel while the remote list state is unknown.
+    Write-Info 'Ищу ранее зарегистрированный DevSpace MCP в OpenAI (без изменений других туннелей).'
+    $remote = Invoke-ListDevSpaceTunnels -ApiKey $admin -Scope $scope
+    if (-not $remote.Success) {
+        Write-Warn 'Не удалось получить список туннелей. Создание нового заблокировано во избежание дубликатов.'
+        $diagnostic = [string]$remote.Output
+        if ($admin) { $diagnostic = $diagnostic.Replace($admin,'[СКРЫТО]') }
+        if ($script:RuntimeKey) { $diagnostic = $diagnostic.Replace($script:RuntimeKey,'[СКРЫТО]') }
+        if ($diagnostic.Length -gt 700) { $diagnostic = $diagnostic.Substring(0,700) + '...' }
+        if ($diagnostic) { Write-Host $diagnostic -ForegroundColor DarkYellow }
+        if ($diagnostic -match '(?i)(401|403|unauthoriz|forbidden|permission|credential|api.?key)') {
+            Write-Warn 'Похоже, административный ключ не имеет нужных прав.'
+            $replacement = Resolve-AdminCreateKey -RequireReplacement
+            if (-not $replacement) { return '' }
+            $admin = $replacement
+            $script:SelectedAdminKey = $admin
+            $remote = Invoke-ListDevSpaceTunnels -ApiKey $admin -Scope $scope
+            if (-not $remote.Success) {
+                Write-Warn 'Повторная проверка списка не прошла; ничего не создаю.'
+                return ''
+            }
+        } else { return '' }
+    }
+    if (@($remote.Tunnels).Count -gt 0) {
+        $id = Select-DevSpaceRemoteTunnelId -Snapshot $remote
+        if (-not $id) { return '' }
+        Save-DevSpaceTunnelId -Settings $Settings -TunnelId $id
+        Write-Ok "Восстановлен DevSpace Tunnel ID: $id"
+        return $id
+    }
+
+    Write-Info 'Зарегистрированных DevSpace MCP не найдено; создаю один новый туннель.'
+    $created = Invoke-CreateDevSpaceTunnel -ApiKey $admin -Scope $scope
+    if ($created.ExitCode -ne 0) {
+        # Also check remote when create reports failure; the server may have
+        # committed the request before a network/CLI reporting failure.
+        Write-Warn ("CLI вернул код {0}. Перед повторной попыткой проверяю реестр туннелей." -f $created.ExitCode)
+        $remote = Invoke-ListDevSpaceTunnels -ApiKey $admin -Scope $scope
+        if ($remote.Success -and @($remote.Tunnels).Count -gt 0) {
+            $id = Select-DevSpaceRemoteTunnelId -Snapshot $remote
+            if ($id) {
+                Save-DevSpaceTunnelId -Settings $Settings -TunnelId $id
+                Write-Ok "Восстановлен DevSpace Tunnel ID: $id"
+                return $id
+            }
+        }
+        $diagnostic = [string]$created.Output
+        if ($admin) { $diagnostic = $diagnostic.Replace($admin,'[СКРЫТО]') }
+        if ($script:RuntimeKey) { $diagnostic = $diagnostic.Replace($script:RuntimeKey,'[СКРЫТО]') }
+        if ($diagnostic.Length -gt 900) { $diagnostic = $diagnostic.Substring(0,900) + '...' }
+        if ($diagnostic) { Write-Host $diagnostic -ForegroundColor DarkYellow }
+        Write-Warn 'Создание не подтверждено. Проверьте доступ к OpenAI или права Tunnels Manage.'
+        return ''
+    }
+
+    $id = ''
+    $json = ConvertFrom-NativeJson -Output $created.Output
+    if ($null -ne $json) {
+        $raw = Get-JsonField -Value $json -Name 'id'
+        if (-not $raw) { $raw = Get-JsonField -Value $json -Name 'tunnel_id' }
+        if (-not $raw) {
+            $nested = Get-JsonField -Value $json -Name 'tunnel'
+            $raw = Get-JsonField -Value $nested -Name 'id'
+        }
+        if ($raw -match '^tunnel_[A-Za-z0-9_-]+$') { $id = [string]$raw }
+    }
+    if (-not $id) {
+        Write-Warn 'Ответ на создание получен, но ID не распознан. Восстанавливаю его из реестра OpenAI.'
+        $remote = Invoke-ListDevSpaceTunnels -ApiKey $admin -Scope $scope
+        if ($remote.Success -and @($remote.Tunnels).Count -gt 0) {
+            $id = Select-DevSpaceRemoteTunnelId -Snapshot $remote
+        }
+    }
+    if (-not $id) {
+        Write-Warn 'Не удалось безопасно определить ID. НОВЫЙ туннель автоматически не создаю.'
+        Write-Host 'Список: https://platform.openai.com/settings/organization/tunnels' -ForegroundColor Cyan
+        return ''
+    }
+    Save-DevSpaceTunnelId -Settings $Settings -TunnelId $id
+    Write-Ok "DevSpace Tunnel ID: $id"
+    Write-Info 'ID сохранён для следующих запусков и подключения плагина ChatGPT.'
+    return $id
 }
 
-function Set-NgrokAuthtokenInteractive {
-    Write-Host ''
-    Write-NoticeBox -Title 'ГДЕ ВЗЯТЬ NGROK AUTHTOKEN' -Lines @(
-        'Откройте страницу:'
-        'https://dashboard.ngrok.com/get-started/your-authtoken'
-        'Скопируйте Authtoken и вставьте его ниже.'
-    )
-    $plain = Read-Host 'Вставьте Authtoken'
-    Set-NgrokAuthtokenValue -Token $plain
+function Select-TunnelCredentials {
+    param($Settings)
+    $script:RuntimeKeyChanged = $false
+    $script:AdminKeyChanged = $false
+    $script:NewAccountBinding = $false
+    $script:SelectedAdminKey = ''
+    if (-not (Resolve-SharedRuntimeKey -Settings $Settings)) { return $false }
+    $id = Resolve-OrCreateDevSpaceTunnelId -Settings $Settings
+    if (-not $id) {
+        Write-Info 'Создание туннеля отменено или не завершено. Возвращаюсь в меню.'
+        return $false
+    }
+    return $true
 }
 
-function Ensure-NgrokAuthtoken {
-    $authState = Get-NgrokAuthState
-    if ($authState.Readable) {
-        Write-Ok ('Authtoken настроен: {0}' -f (Get-MaskedSecret $authState.Token))
-    } else {
-        Set-NgrokAuthtokenInteractive
+function Test-LocalReady {
+    param([Parameter(Mandatory=$true)][string]$Url)
+    Add-Type -AssemblyName System.Net.Http -ErrorAction Stop
+    $handler = New-Object System.Net.Http.HttpClientHandler
+    $handler.UseProxy = $false
+    $client = New-Object System.Net.Http.HttpClient($handler)
+    $client.Timeout = [TimeSpan]::FromSeconds(2)
+    try {
+        $r = $client.GetAsync($Url).GetAwaiter().GetResult()
+        return ($r.StatusCode -eq [System.Net.HttpStatusCode]::OK)
+    } catch { return $false }
+    finally { $client.Dispose(); $handler.Dispose() }
+}
+
+function Show-SecureTunnelLogs {
+    foreach ($p in @($script:BridgeStdErr, $script:TunnelStdErr)) {
+        if ($p -and (Test-Path -LiteralPath $p)) {
+            $lines = @(Get-Content -LiteralPath $p -Tail 30 -ErrorAction SilentlyContinue)
+            foreach ($line in $lines) { Write-Host $line -ForegroundColor DarkRed }
+        }
     }
 }
 
@@ -2287,7 +2586,8 @@ function Set-DevSpaceAllowedRoots {
         $j = $content | ConvertFrom-Json
         if (-not $j.workspaces) { $j | Add-Member -NotePropertyName workspaces -NotePropertyValue ([pscustomobject]@{}) }
         $j.workspaces | Add-Member -NotePropertyName allowedRoots -NotePropertyValue @($Roots) -Force
-        $jsonText = $j | ConvertTo-Json -Depth 20`n        [IO.File]::WriteAllText($configPath, $jsonText, (New-Object Text.UTF8Encoding($false)))
+        $jsonText = $j | ConvertTo-Json -Depth 20
+        [IO.File]::WriteAllText($configPath, $jsonText, (New-Object Text.UTF8Encoding($false)))
     }
 
     try {
@@ -2503,22 +2803,15 @@ function Invoke-DevSpaceDoctor {
 }
 
 function Load-Settings {
-    $obj = [ordered]@{ FixedDomain=$null; LastTunnelMode='random' }
+    $obj = [ordered]@{ TunnelId=''; KeyFilePath=''; RuntimeKeyFingerprint=''; AdminKeyFingerprint='' }
     if (Test-Path -LiteralPath $SettingsPath) {
         try {
             $j = Get-Content -LiteralPath $SettingsPath -Raw | ConvertFrom-Json
-            if ($j.FixedDomain) { $obj.FixedDomain = [string]$j.FixedDomain }
-            if ($j.LastTunnelMode) { $obj.LastTunnelMode = [string]$j.LastTunnelMode }
-        } catch { Write-Warn "Не удалось прочитать settings JSON: $($_.Exception.Message)" }
-    }
-    if (-not $obj.FixedDomain -and (Test-Path -LiteralPath $LegacyDomainPath)) {
-        try {
-            $legacy = (Get-Content -LiteralPath $LegacyDomainPath -Raw).Trim([char]0xFEFF).Trim()
-            if ($legacy) {
-                $obj.FixedDomain = ($legacy -replace '^https?://','' -replace '/mcp/?$','' -replace '/+$','')
-                $obj.LastTunnelMode = 'fixed'
-            }
-        } catch {}
+            if ($j.TunnelId) { $obj.TunnelId = [string]$j.TunnelId }
+            if ($j.KeyFilePath) { $obj.KeyFilePath = [string]$j.KeyFilePath }
+            if ($j.RuntimeKeyFingerprint) { $obj.RuntimeKeyFingerprint = [string]$j.RuntimeKeyFingerprint }
+            if ($j.AdminKeyFingerprint) { $obj.AdminKeyFingerprint = [string]$j.AdminKeyFingerprint }
+        } catch { Write-Warn "Не удалось прочитать настройки Secure Tunnel: $($_.Exception.Message)" }
     }
     return $obj
 }
@@ -2528,164 +2821,17 @@ function Save-Settings {
     $Settings | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $SettingsPath -Encoding UTF8
 }
 
-function Normalize-NgrokOrigin {
-    param([string]$InputText)
-    if ([string]::IsNullOrWhiteSpace($InputText)) { throw 'Адрес не введён.' }
-    $s = $InputText.Trim().Trim('"','''')
-    $s = $s -replace '\\','/'
-    if ($s -notmatch '^[a-zA-Z][a-zA-Z0-9+.-]*://') { $s = 'https://' + $s }
-    try { $u = [Uri]$s } catch { throw "Некорректный URL: $InputText" }
-    if (-not $u.IsAbsoluteUri) { throw 'Нужен абсолютный HTTPS URL.' }
-    if ($u.Scheme -ne 'https') { throw 'Для публичного MCP нужен https:// адрес.' }
-    if ([string]::IsNullOrWhiteSpace($u.Host)) { throw 'В URL отсутствует домен.' }
-    if ($u.Query -or $u.Fragment) { throw 'Не добавляйте query-параметры или #fragment к адресу ngrok.' }
-    $path = $u.AbsolutePath.TrimEnd('/')
-    if ($path -and $path -ne '' -and $path -ne '/mcp') {
-        throw "В адресе обнаружен лишний путь '$path'. Нужен только домен; /mcp скрипт добавляет сам для ChatGPT."
-    }
-    if ($path -eq '/mcp') { Write-Warn 'Вы ввели /mcp. Для publicBaseUrl он удалён автоматически.' }
-    $builder = New-Object UriBuilder($u.Scheme, $u.Host)
-    if (-not $u.IsDefaultPort) { $builder.Port = $u.Port } else { $builder.Port = -1 }
-    $builder.Path = ''
-    $builder.Query = ''
-    $builder.Fragment = ''
-    return $builder.Uri.AbsoluteUri.TrimEnd('/')
-}
 
-function Set-FixedDomainInteractive {
-    param($Settings)
-    Write-Rule 'ФИКСИРОВАННЫЙ NGROK DEV DOMAIN'
-    Write-NoticeBox -Title 'ГДЕ ВЗЯТЬ ФИКСИРОВАННЫЙ DEV DOMAIN' -Lines @(
-        'Откройте страницу:'
-        'https://dashboard.ngrok.com/domains'
-        'Скопируйте ваш Dev Domain. Можно вставить с https:// или без него.'
-    )
-    Write-Host 'Введите Dev Domain / ngrok URL.' -ForegroundColor Cyan
-    Write-Host 'Пример:  bright-forest-panda.ngrok-free.dev' -ForegroundColor DarkGray
-    Write-Host 'Пример:  https://bright-forest-panda.ngrok-free.dev' -ForegroundColor DarkGray
-    Write-Host 'Не надо: .../mcp  (если введёте, скрипт удалит /mcp).' -ForegroundColor DarkGray
-    $raw = Read-Host 'Адрес'
-    $origin = Normalize-NgrokOrigin $raw
-    $Settings.FixedDomain = ([Uri]$origin).Host
-    $Settings.LastTunnelMode = 'fixed'
-    Save-Settings $Settings
-    Write-Ok "Сохранён фиксированный домен: $($Settings.FixedDomain)"
-}
 
-function Select-TunnelModeInteractive {
-    param($Settings)
-    while ($true) {
-        Write-Rule 'РЕЖИМ NGROK'
-        $savedMode = if ($Settings.LastTunnelMode -eq 'fixed' -and $Settings.FixedDomain) { 'fixed' } else { 'random' }
-        $savedNumber = if ($savedMode -eq 'fixed') { '1' } else { '2' }
-        $savedLabel = if ($savedMode -eq 'fixed') { 'Фиксированный Dev Domain' } else { 'Временный случайный адрес ngrok' }
-        Write-SavedAccent ("Сохранённый режим: [{0}] {1}" -f $savedNumber, $savedLabel)
-        Write-Host ''
-        Write-Host '  [1] Фиксированный Dev Domain  <- рекомендуемый путь' -ForegroundColor Green
-        Write-Host '  [2] Временный случайный адрес ngrok' -ForegroundColor White
-        Write-SavedAccent '  Enter — оставить сохранённый режим.'
-        Write-Host '  B — назад в главное меню.' -ForegroundColor DarkGray
-        $choice = (Read-Host 'Режим').Trim()
-        if ($choice -match '(?i)^(b|back|назад)$') { return $null }
-        if (-not $choice) { return $savedMode }
-        switch ($choice) {
-            '1' { $Settings.LastTunnelMode = 'fixed'; Save-Settings $Settings; return 'fixed' }
-            '2' { $Settings.LastTunnelMode = 'random'; Save-Settings $Settings; return 'random' }
-            default { Write-Warn 'Введите 1, 2, Enter или B.' }
-        }
-    }
-}
 
-function Select-FixedDomainInteractive {
-    param($Settings, [string]$Mode)
-    if ($Mode -ne 'fixed') { return $true }
-    while ($true) {
-        Write-Rule 'ФИКСИРОВАННЫЙ NGROK DEV DOMAIN'
-        Write-NoticeBox -Title 'ГДЕ ВЗЯТЬ ФИКСИРОВАННЫЙ DEV DOMAIN' -Lines @(
-            'Откройте страницу:'
-            'https://dashboard.ngrok.com/domains'
-            'Скопируйте ваш Dev Domain. Например: bright-forest-panda.ngrok-free.dev'
-        )
-        if ($Settings.FixedDomain) {
-            Write-SavedAccent ("Сохранённый домен: https://{0}" -f $Settings.FixedDomain)
-            Write-SavedAccent 'Enter — оставить сохранённый домен.'
-        } else {
-            Write-Host 'Фиксированный домен ещё не сохранён.' -ForegroundColor Yellow
-        }
-        Write-Host 'Введите другой домен, чтобы заменить сохранённый.' -ForegroundColor White
-        Write-Host 'B — назад в главное меню.' -ForegroundColor DarkGray
-        $raw = (Read-Host 'Dev Domain').Trim()
-        if ($raw -match '(?i)^(b|back|назад)$') { return $false }
-        if (-not $raw) {
-            if ($Settings.FixedDomain) { return $true }
-            Write-Warn 'Сохранённого Dev Domain нет — введите домен.'
-            continue
-        }
-        try {
-            $origin = Normalize-NgrokOrigin $raw
-            $Settings.FixedDomain = ([Uri]$origin).Host
-            $Settings.LastTunnelMode = 'fixed'
-            Save-Settings $Settings
-            Write-Ok "Сохранён фиксированный домен: $($Settings.FixedDomain)"
-            return $true
-        } catch { Write-Warn $_.Exception.Message }
-    }
-}
 
-function Select-NgrokAuthtokenInteractive {
-    while ($true) {
-        Write-Rule 'NGROK AUTHTOKEN'
-        Write-NoticeBox -Title 'ГДЕ ВЗЯТЬ NGROK AUTHTOKEN' -Lines @(
-            'Откройте страницу:'
-            'https://dashboard.ngrok.com/get-started/your-authtoken'
-            'Скопируйте Authtoken и вставьте его ниже.'
-        )
 
-        $authState = Get-NgrokAuthState
-        if ($authState.Readable) {
-            Write-SavedAccent ("Сохранённый токен: {0}" -f (Get-MaskedSecret $authState.Token))
-            Write-SavedAccent 'Enter — оставить сохранённый токен.'
-        } else {
-            Write-Host 'Authtoken ещё не настроен или не читается из конфигурации ngrok.' -ForegroundColor Yellow
-            if ($authState.ConfigPath) {
-                Write-Host ("Активный конфиг ngrok: {0}" -f $authState.ConfigPath) -ForegroundColor DarkGray
-            }
-            if ($authState.ConfigValid) {
-                Write-Warn 'ngrok считает конфигурацию синтаксически валидной, но ключ authtoken в ней не найден. Это НЕ считается сохранённым токеном.'
-            }
-        }
 
-        Write-Host 'Введите новый токен, чтобы заменить или настроить его.' -ForegroundColor White
-        Write-Host 'B — назад в главное меню.' -ForegroundColor DarkGray
 
-        $raw = (Read-HostWithoutTranscript -Prompt 'Authtoken').Trim()
-        if ($raw -match '(?i)^(b|back|назад)$') { return $false }
 
-        if (-not $raw) {
-            if ($authState.Readable) { return $true }
-            Write-Warn 'Сохранённый Authtoken не найден — вставьте токен.'
-            continue
-        }
 
-        try {
-            Set-NgrokAuthtokenValue -Token $raw
-            return $true
-        } catch {
-            Write-Warn $_.Exception.Message
-        }
-    }
-}
 
-function Stop-PreviousNgrok {
-    try {
-        $procs = Get-Process -Name ngrok -ErrorAction SilentlyContinue
-        if ($procs) {
-            Write-Info 'Останавливаю ранее запущенный ngrok, чтобы не было конфликта туннелей.'
-            $procs | Stop-Process -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Milliseconds 800
-        }
-    } catch {}
-}
+
 
 function Test-DevSpacePort {
     try {
@@ -2708,209 +2854,41 @@ function Test-DevSpacePort {
     }
 }
 
-function Get-NgrokPublicUrl {
-    try {
-        $tunnels = Invoke-RestMethod -Uri 'http://127.0.0.1:4040/api/tunnels' -TimeoutSec 2 -ErrorAction Stop
-        $t = $tunnels.tunnels | Where-Object { $_.public_url -like 'https://*' } | Select-Object -First 1
-        if ($t) { return [string]$t.public_url }
-    } catch {}
-    return $null
-}
 
-function Show-NgrokFailureLogs {
-    if ($script:NgrokFailureLogsShown) { return }
-    $script:NgrokFailureLogsShown = $true
-    if ($script:NgrokStdOut -and (Test-Path $script:NgrokStdOut)) {
-        $txt = Get-Content -LiteralPath $script:NgrokStdOut -Raw -ErrorAction SilentlyContinue
-        if ($txt) { Write-Host "`n--- ngrok stdout ---" -ForegroundColor Red; Write-Host $txt }
-    }
-    if ($script:NgrokStdErr -and (Test-Path $script:NgrokStdErr)) {
-        $txt = Get-Content -LiteralPath $script:NgrokStdErr -Raw -ErrorAction SilentlyContinue
-        if ($txt) { Write-Host "`n--- ngrok stderr ---" -ForegroundColor Red; Write-Host $txt }
-    }
-}
 
-function Start-NgrokTunnel {
-    param([string]$Mode, $Settings, [string]$Winget, [switch]$RetryAfterRepair)
-    $script:NgrokFailureLogsShown = $false
-    Stop-PreviousNgrok
-    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $script:NgrokStdOut = Join-Path $LogDir "ngrok-$stamp.stdout.log"
-    $script:NgrokStdErr = Join-Path $LogDir "ngrok-$stamp.stderr.log"
-    $args = @('http', [string]$Port)
-    if ($Mode -eq 'fixed') {
-        $origin = Normalize-NgrokOrigin $Settings.FixedDomain
-        $args += ("--url={0}" -f $origin)
-        Write-Info "Запускаю ngrok с фиксированным URL: $origin"
-    } else {
-        Write-Info 'Запускаю ngrok со случайным HTTPS URL.'
-    }
-    # The launcher may have read the token from an MSIX/Store ngrok config,
-    # whereas the selected standalone ngrok.exe reads a different config.
-    # Pass the already configured token to the spawned ngrok process using
-    # NGROK_AUTHTOKEN, without exposing it in command-line arguments or logs.
-    $authState = Get-NgrokAuthState
-    if (-not $authState.Readable -or [string]::IsNullOrWhiteSpace($authState.Token)) {
-        throw 'ngrok Authtoken не найден. Настройте токен в меню лаунчера перед запуском.'
-    }
-    $previousToken = [Environment]::GetEnvironmentVariable('NGROK_AUTHTOKEN', 'Process')
-    try {
-        [Environment]::SetEnvironmentVariable('NGROK_AUTHTOKEN', $authState.Token, 'Process')
-        $script:NgrokProcess = Start-Process -FilePath $script:NgrokExe -ArgumentList $args -PassThru -WindowStyle Hidden -RedirectStandardOutput $script:NgrokStdOut -RedirectStandardError $script:NgrokStdErr
-        Register-ManagedProcess -Process $script:NgrokProcess -Name 'ngrok'
-        Save-RuntimeState
-    } catch {
-        $launchError = $_.Exception.ToString()
 
-        # Microsoft Store/MSIX executables can already be constrained by a
-        # package Job Object. In that case Windows may reject attaching ngrok
-        # to our KILL_ON_JOB_CLOSE guard. Fall back once to the official
-        # standalone ZIP, whose process can be managed reliably.
-        if (($launchError -match 'Windows Job Object') -and
-            ($script:NgrokExe -match '(?i)\\Microsoft\\WindowsApps\\') -and
-            (-not $RetryAfterRepair)) {
-            Write-Warn 'Store-версию ngrok не удалось привязать к защите жизненного цикла. Переключаюсь на официальный standalone ZIP и повторяю запуск.'
-            try {
-                Install-NgrokStandalone
-                $standalone = Join-Path $env:LOCALAPPDATA 'Programs\ngrok\ngrok.exe'
-                if (-not (Test-Path -LiteralPath $standalone -PathType Leaf)) {
-                    throw 'После установки standalone ZIP ngrok.exe не найден.'
-                }
-                $script:NgrokExe = $standalone
-                return Start-NgrokTunnel -Mode $Mode -Settings $Settings -Winget $Winget -RetryAfterRepair
-            } catch {
-                throw "Не удалось запустить ngrok и перейти со Store-версии на standalone ZIP: $($_.Exception.ToString())"
-            }
-        }
 
-        throw "Не удалось запустить ngrok: $launchError"
-    } finally {
-        # Restore the launcher's previous environment, including on retry/failure.
-        [Environment]::SetEnvironmentVariable('NGROK_AUTHTOKEN', $previousToken, 'Process')
-        $authState = $null
-    }
 
-    $url = $null
-    for ($i=0; $i -lt 30; $i++) {
-        Start-Sleep -Milliseconds 500
-        if ($script:NgrokProcess.HasExited) { break }
-        $url = Get-NgrokPublicUrl
-        if ($url) { break }
-    }
-    if ($url) {
-        $origin = Normalize-NgrokOrigin $url
-        Write-Ok "ngrok туннель готов: $origin"
-        return $origin
-    }
 
-    Show-NgrokFailureLogs
-    $combined = ''
-    if (Test-Path $script:NgrokStdOut) { $combined += (Get-Content $script:NgrokStdOut -Raw -ErrorAction SilentlyContinue) }
-    if (Test-Path $script:NgrokStdErr) { $combined += "`n" + (Get-Content $script:NgrokStdErr -Raw -ErrorAction SilentlyContinue) }
-    try { if ($script:NgrokProcess -and -not $script:NgrokProcess.HasExited) { $script:NgrokProcess.Kill() } } catch {}
 
-    if (($combined -match 'ERR_NGROK_121') -and (-not $RetryAfterRepair)) {
-        Write-Warn 'Получен ERR_NGROK_121: ngrok требует более новый агент. Автоматически обновляю/переустанавливаю через официальный ZIP и повторяю запуск один раз.'
-        $fixed = Repair-NgrokVersion -Winget $Winget
-        $script:NgrokExe = $fixed.Path
-        return Start-NgrokTunnel -Mode $Mode -Settings $Settings -Winget $Winget -RetryAfterRepair
-    }
-    if ($combined -match 'ERR_NGROK_4018') {
-        Write-NoticeBox -Title 'NGROK НЕ ПРИНЯЛ АВТОРИЗАЦИЮ' -Lines @(
-            'Лаунчер передал сохранённый Authtoken в процесс ngrok.'
-            'Если ERR_NGROK_4018 повторяется, проверьте токен в ngrok dashboard.'
-            'Затем в меню лаунчера введите полный актуальный Authtoken заново.'
-            'Не отправляйте сам токен в чат или диагностический лог.'
-        )
-        throw 'ngrok отклонил авторизацию (ERR_NGROK_4018). Проверьте сохранённый Authtoken.'
-    }
-    if ($combined -match 'ERR_NGROK_9040') {
-        Write-NoticeBox -Title 'NGROK НЕ РАЗРЕШАЕТ ПОДКЛЮЧЕНИЕ С ТЕКУЩЕГО IP' -Lines @(
-            'ERR_NGROK_9040 означает, что ngrok отклонил подключение с текущего исходящего IP.'
-            'Это не ошибка Dev Domain, Authtoken или версии ngrok.'
-            'ВАЖНО ДЛЯ VPN: если VPN включён, первым делом проверьте его режим.'
-            'Переключите VPN в режим полного туннелирования (Tunnel/TUN/VPN), а не System Proxy/системный прокси.'
-            'После переключения режима VPN повторите запуск DevSpace MCP.'
-            'Случайный URL ngrok здесь не поможет, если агент всё равно выходит в интернет через тот же заблокированный IP.'
-            'Если VPN не используется, отключите TOR/анонимизирующие прокси или попробуйте другую сеть.'
-            'Документация: https://ngrok.com/docs/errors/err_ngrok_9040'
-            'Поддержка: support@ngrok.com'
-        )
-        throw 'ngrok отклонил подключение с текущего IP (ERR_NGROK_9040). Следуйте жёлтой подсказке выше.'
-    }
-    throw "ngrok не создал туннель. Полный stdout/stderr показан выше и сохранён в $LogDir"
-}
-
-function Get-OwnerToken {
-    $auth = Join-Path $env:USERPROFILE '.devspace\auth.json'
-    if (-not (Test-Path -LiteralPath $auth)) { return $null }
-    try {
-        $j = Get-Content -LiteralPath $auth -Raw | ConvertFrom-Json
-        return [string]$j.ownerToken
-    } catch { return $null }
-}
 
 function Show-ConnectionCard {
-    param([string]$PublicOrigin)
-    $owner = Get-OwnerToken
-    $mcp = $PublicOrigin.TrimEnd('/') + '/mcp'
-    $authPath = Join-Path $env:USERPROFILE '.devspace\auth.json'
-
-    Stop-Log
-
-    Write-Rule 'РАСШИРЕННЫЕ ДАННЫЕ'
-    Write-Host 'Authentication:' -ForegroundColor Yellow
-    Write-Host '  OAuth' -ForegroundColor White
+    param([string]$TunnelId)
+    Write-Rule 'SECURE MCP TUNNEL — ПОДКЛЮЧЕНИЕ'
+    Write-Host ("  Tunnel ID       : {0}" -f $TunnelId) -ForegroundColor Green
+    Write-Host ("  DevSpace        : http://127.0.0.1:{0}/mcp" -f $Port)
+    Write-Host ("  OAuth bridge    : http://127.0.0.1:{0}/mcp" -f $script:BridgePort)
+    Write-Host ("  Tunnel dashboard: http://127.0.0.1:{0}/ui" -f $script:HealthPort) -ForegroundColor Cyan
     Write-Host ''
-    Write-Host 'Файл с Owner Password:' -ForegroundColor Yellow
-    Write-Host ("  {0}" -f $authPath) -ForegroundColor White
+    Write-Host 'ChatGPT → Settings → Plugins → Add custom MCP server:' -ForegroundColor Yellow
+    Write-Host '  Connection: Tunnel' -ForegroundColor White
+    Write-Host ("  Tunnel:     {0}" -f $TunnelId) -ForegroundColor White
+    Write-Host '  Authentication: No authentication / Unauthenticated' -ForegroundColor White
+    Write-Host '  Name:       DevSpacePC (Secure Tunnel)' -ForegroundColor White
     Write-Host ''
-    Write-Host 'Локальный MCP:' -ForegroundColor Yellow
-    Write-Host ("  http://127.0.0.1:{0}/mcp" -f $Port) -ForegroundColor White
-    Write-Host 'ngrok Inspector:' -ForegroundColor Yellow
-    Write-Host '  http://127.0.0.1:4040' -ForegroundColor White
-    Write-Host ''
-    Write-Host 'Техническая информация:' -ForegroundColor Yellow
-    Write-Host '  • publicBaseUrl в DevSpace хранится БЕЗ /mcp.' -ForegroundColor Gray
-    Write-Host '  • URL подключения к MCP заканчивается на /mcp.' -ForegroundColor Gray
-    Write-Host '  • Owner Password не публикуйте и не отправляйте другим людям.' -ForegroundColor Gray
-
-    Write-Rule 'ГОТОВО — ДАННЫЕ ДЛЯ CHATGPT'
-    Write-NoticeBox -Title 'КАК ДОБАВИТЬ CUSTOM MCP В CHATGPT' -Lines @(
-        'Откройте страницу: https://chatgpt.com/plugins?directoryTab=personal'
-        'или в ChatGPT перейдите: Plugins → + → Add custom MCP server.'
-        'Authentication выберите OAuth.'
-        'Ниже находятся два основных значения для подключения.'
-    )
-    Write-Host ''
-    Write-Host 'Название:' -ForegroundColor Yellow
-    Write-Host '  DevSpace MCP' -ForegroundColor White
-    Write-Host ''
-    Write-Host 'MCP Server URL:' -ForegroundColor Cyan
-    Write-Host ("  {0}" -f $mcp) -ForegroundColor Green
-    Write-Host ''
-    Write-Host 'Owner Password:' -ForegroundColor Cyan
-    if ($owner) { Write-Host ("  {0}" -f $owner) -ForegroundColor Magenta }
-    else { Write-Host '  НЕ НАЙДЕН — проверьте auth.json' -ForegroundColor Red }
-    Write-Host ('=' * 78) -ForegroundColor DarkCyan
-    Write-Host ''
-
-    Start-Log -Append
+    Write-Host 'Для проверки подключения используйте open_workspace.' -ForegroundColor Yellow
+    Write-Host 'Токены DevSpace находятся только в памяти OAuth bridge и не сохраняются.' -ForegroundColor Gray
 }
 
 function Show-VersionSummary {
-    param([string]$Winget, [pscustomobject]$NodeInfo, $NgrokInfo, [string]$DevSpaceVersion)
+    param([string]$Winget, [pscustomobject]$NodeInfo, [string]$DevSpaceVersion)
     Write-Rule 'ПРОВЕРКА КОМПОНЕНТОВ'
-    $wv = Invoke-Native -FilePath $Winget -Arguments @('--version') -Quiet
     $git = Get-CommandPath -Name 'git.exe'
     $gv = if ($git) { (Invoke-Native -FilePath $git -Arguments @('--version') -Quiet).Output.Trim() } else { 'не найден' }
-    $npmv = (Invoke-Native -FilePath $NodeInfo.Npm -Arguments @('--version') -Quiet).Output.Trim()
-    Write-Host ("  WinGet   : {0}" -f $wv.Output.Trim())
     Write-Host ("  Git      : {0}" -f $gv)
     Write-Host ("  Git Bash : {0}" -f $script:GitBash)
     Write-Host ("  Node.js  : {0} ({1} LTS)" -f $NodeInfo.Version, $NodeInfo.Lts)
-    Write-Host ("  npm      : {0}" -f $npmv)
-    Write-Host ("  ngrok    : {0}" -f $NgrokInfo.Raw)
+    Write-Host ("  tunnel   : {0}" -f $script:TunnelExe)
     Write-Host ("  DevSpace : {0}" -f $DevSpaceVersion)
     Write-Host ("  Log      : {0}" -f $LogPath) -ForegroundColor DarkGray
 }
@@ -2945,30 +2923,24 @@ function Open-DevSpaceNativeSettings {
 function Ensure-DevSpaceInitializedForLauncher {
     if (Test-DevSpaceInitialized) { return $true }
     Write-NoticeBox -Title 'ПЕРВАЯ ИНИЦИАЛИЗАЦИЯ DEVSPACE' -Lines @(
-        'DevSpace ещё не создавал свои config/auth файлы.'
-        'Сейчас откроется его официальный мастер один раз.'
-        'После него основной запуск отдельно спросит разрешённые папки, ngrok-режим, домен и токен.'
+        'Откроется официальный мастер DevSpace.'
+        'Адрес DevSpace для локальной настройки: http://127.0.0.1:7676.'
+        'Разрешённые папки задаются отдельно в следующем шаге.'
     )
     $cmd = (Get-DevSpaceCommand) + ' init'
     Stop-Log
     try { Invoke-DevSpaceInitWithTty -Command $cmd }
     finally { Start-Log -Append }
-    if (-not (Test-DevSpaceInitialized)) {
-        Write-Warn 'DevSpace init не создал конфигурацию.'
-        return $false
-    }
+    if (-not (Test-DevSpaceInitialized)) { Write-Warn 'DevSpace init не создал конфигурацию.'; return $false }
     return $true
 }
 
 function Configure-LaunchWizard {
     param($Settings)
-    if (-not (Ensure-DevSpaceInitializedForLauncher)) { return $null }
-    if (-not (Select-AllowedRootsInteractive)) { return $null }
-    $mode = Select-TunnelModeInteractive -Settings $Settings
-    if (-not $mode) { return $null }
-    if (-not (Select-FixedDomainInteractive -Settings $Settings -Mode $mode)) { return $null }
-    if (-not (Select-NgrokAuthtokenInteractive)) { return $null }
-    return [pscustomobject]@{ Mode=$mode }
+    if (-not (Ensure-DevSpaceInitializedForLauncher)) { return $false }
+    if (-not (Select-AllowedRootsInteractive)) { return $false }
+    if (-not (Select-TunnelCredentials -Settings $Settings)) { return $false }
+    return $true
 }
 
 function Stop-DevSpaceServerBackground {
@@ -3013,23 +2985,7 @@ function Stop-DevSpaceServerBackground {
     }
 }
 
-function Stop-NgrokTunnelBackground {
-    try {
-        if ($script:NgrokProcess -and -not $script:NgrokProcess.HasExited) {
-            $script:NgrokProcess.Kill()
-            try { [void]$script:NgrokProcess.WaitForExit(3000) } catch {}
-            Write-Ok 'ngrok остановлен.'
-        }
-    } catch {
-        Write-Warn "Не удалось штатно остановить ngrok: $($_.Exception.Message)"
-    } finally {
-        $script:NgrokProcess = $null
-        Save-RuntimeState
-        if (-not $script:DevSpaceProcess -and -not $script:DevSpaceWatchdogProcess) {
-            Clear-RuntimeState
-        }
-    }
-}
+
 
 function Show-DevSpaceServerFailureLogs {
     if ($script:DevSpaceStdOut -and (Test-Path -LiteralPath $script:DevSpaceStdOut)) {
@@ -3114,7 +3070,7 @@ function Start-DevSpaceServerBackground {
             } else {
                 Write-Info 'Защита доступа активна: Windows Job Object.'
             }
-            Write-Info 'Закрытие этого окна или Ctrl+C автоматически остановит DevSpace и ngrok.'
+            Write-Info 'Закрытие этого окна или Ctrl+C автоматически остановит DevSpace и Secure MCP Tunnel.'
             return
         }
     }
@@ -3132,85 +3088,326 @@ function Restart-DevSpaceServerForRoots {
 }
 
 function Show-RunningServerMenu {
-    param([string]$PublicOrigin)
+    param([string]$TunnelId)
     while ($true) {
-        Write-Rule 'DEVSPACE MCP — СЕРВЕР ЗАПУЩЕН'
+        Write-Rule 'DEVSPACE MCP — SECURE TUNNEL ЗАПУЩЕН'
         $roots = @(Get-DevSpaceAllowedRoots)
         Write-AccessWarningBox -Roots $roots
-        Write-Host ("  MCP Server URL : {0}/mcp" -f $PublicOrigin.TrimEnd('/')) -ForegroundColor Green
-        Write-Host ("  DevSpace       : запущен, порт {0}" -f $Port) -ForegroundColor Green
-        Write-Host '  ngrok          : запущен' -ForegroundColor Green
-        $protectionLabel = if ($script:DevSpaceJobProtected -and $script:DevSpaceWatchdogProcess) {
-            'Windows Job Object + watchdog'
-        } elseif ($script:DevSpaceWatchdogProcess) {
-            'watchdog'
-        } else {
-            'Windows Job Object'
-        }
-        Write-Host ("  Защита         : {0}; закрытие окна / Ctrl+C = оборвать MCP-доступ" -f $protectionLabel) -ForegroundColor Yellow
+        Write-Host ("  Tunnel ID : {0}" -f $TunnelId) -ForegroundColor Green
+        Write-Host ("  DevSpace  : http://127.0.0.1:{0}/mcp" -f $Port) -ForegroundColor Green
+        Write-Host ("  Tunnel UI : http://127.0.0.1:{0}/ui" -f $script:HealthPort) -ForegroundColor Cyan
+        Write-Host '  Закрытие окна / Ctrl+C останавливает DevSpace, OAuth bridge и tunnel-client.' -ForegroundColor Yellow
         Write-Host ''
-        Write-Host '  [1] Изменить разрешённые папки и применить' -ForegroundColor Green
-        Write-Host '      Если папки изменятся, DevSpace перезапустится автоматически.' -ForegroundColor Gray
-        Write-Host ''
-        Write-Host '  [0] Остановить сервер и вернуться в главное меню' -ForegroundColor Yellow
-        Write-Host ''
-        Write-Host '  Здесь Enter ничего не выбирает — введите 1 или 0.' -ForegroundColor Magenta
+        Write-Host '  [1] Изменить разрешённые папки (перезапуск DevSpace и OAuth bridge)' -ForegroundColor Green
+        Write-Host '  [0] Остановить всё и вернуться в главное меню' -ForegroundColor Yellow
         $choice = (Read-Host 'Выбор').Trim()
-        if (-not $choice) {
-            Write-Warn 'Введите конкретный пункт: 1 или 0.'
-            continue
-        }
         switch ($choice) {
             '1' {
                 $before = @($roots | ForEach-Object { $_.ToLowerInvariant() }) -join '|'
                 $selected = Select-AllowedRootsInteractive -BackLabel 'меню запущенного сервера'
                 if (-not $selected) { continue }
-                $afterRoots = @(Get-DevSpaceAllowedRoots)
-                $after = @($afterRoots | ForEach-Object { $_.ToLowerInvariant() }) -join '|'
-                if ($before -eq $after) {
-                    Write-Info 'Разрешённые папки не изменились. Перезапуск сервера не требуется.'
-                } else {
-                    Restart-DevSpaceServerForRoots
+                $after = @(Get-DevSpaceAllowedRoots | ForEach-Object { $_.ToLowerInvariant() }) -join '|'
+                if ($before -ne $after) {
+                    Write-Info 'Перезапускаю всю сессию, чтобы OAuth-грант соответствовал новым папкам.'
+                    return 'restart'
                 }
             }
-            '0' { return }
-            default { Write-Warn 'Неизвестный пункт. Введите 1 или 0.' }
+            '0' { return 'stop' }
+            default { Write-Warn 'Введите 1 или 0.' }
         }
     }
 }
 
-function Start-DevSpaceSession {
-    param([string]$Winget, $Settings, [string]$Mode)
-
-    $origin = $null
+function Show-DevSpaceOwnerPassword {
+    # Call only while Start-Transcript is stopped. This is a local secret and
+    # must never end up in the launcher logs or subprocess command lines.
+    $authPath = Join-Path $env:USERPROFILE '.devspace\auth.json'
+    Write-NoticeBox -Title 'ПАРОЛЬ ДЛЯ ПОДКЛЮЧЕНИЯ DEVSPACE' -Lines @(
+        'Owner Password создан локальным DevSpace при первоначальной настройке.'
+        'Он НЕ является OpenAI API key, Admin key или Tunnel ID.'
+        'Вставьте значение ниже в поле Owner password в открывшемся браузере.'
+        'Никому не отправляйте этот пароль и не публикуйте скриншоты с ним.'
+    )
+    if (-not (Test-Path -LiteralPath $authPath -PathType Leaf)) {
+        Write-Warn ("Файл с Owner Password не найден: {0}" -f $authPath)
+        Write-Host 'Настройте DevSpace через его штатный мастер (пункт 2 главного меню).' -ForegroundColor Yellow
+        return
+    }
+    $ownerPassword = $null
     try {
-        Write-Step 'Запуск туннеля ngrok'
-        Test-DevSpacePort
-        $origin = Start-NgrokTunnel -Mode $Mode -Settings $Settings -Winget $Winget
+        $auth = Get-Content -LiteralPath $authPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        $ownerPassword = [string]$auth.ownerToken
+    } catch {
+        Write-Warn 'Не удалось прочитать ownerToken из auth.json. Проверьте штатную настройку DevSpace.'
+        return
+    }
+    if ([string]::IsNullOrWhiteSpace($ownerPassword)) {
+        Write-Warn 'В auth.json отсутствует ownerToken. Запустите штатную настройку DevSpace.'
+        return
+    }
+    Write-Host 'Owner Password (для копирования в браузер):' -ForegroundColor Cyan
+    Write-Host ("  {0}" -f $ownerPassword) -ForegroundColor Magenta
+    Write-Host ("Файл: {0}" -f $authPath) -ForegroundColor DarkGray
+    Write-Host 'Пароль показан только в консоли; в журнал запуска не записывается.' -ForegroundColor DarkGray
+    Write-Host ''
+}
 
-        Write-Step 'Обновление публичного URL DevSpace'
-        Set-DevSpacePublicUrl -PublicOrigin $origin
-
-        if (-not (Test-DevSpaceAllowedRootsConfigured)) {
-            throw 'Разрешённые папки Project Roots не настроены. Запуск MCP остановлен.'
-        }
-
-        Write-Step 'Диагностика DevSpace перед запуском'
-        $doctorOk = Invoke-DevSpaceDoctor
-        if (-not $doctorOk) {
-            $ans = (Read-Host 'Doctor сообщил ошибку. Всё равно попробовать запустить сервер? [y/N]').Trim().ToLowerInvariant()
-            if ($ans -ne 'y' -and $ans -ne 'yes') { throw 'Запуск отменён после ошибки devspace doctor.' }
-        }
-
-        Write-Step 'Запуск DevSpace MCP server'
-        Start-DevSpaceServerBackground
-
-        # Connection data is useful only after the server has actually opened its port.
-        Show-ConnectionCard -PublicOrigin $origin
-        Show-RunningServerMenu -PublicOrigin $origin
+function Start-DevSpaceOAuthBridge {
+    Write-Step 'DevSpace OAuth: локальный мост на 127.0.0.1'
+    $file = Join-Path $RuntimeDir 'devspace-oauth-bridge.js'
+    $js = @'
+'use strict';
+// Generated at runtime by the DevSpace Secure MCP Tunnel launcher.
+// OAuth credentials are kept only in this process memory; no extra Docker container.
+const http = require('node:http');
+const { createHash, randomBytes } = require('node:crypto');
+const { URL, URLSearchParams } = require('node:url');
+const upstream = new URL(process.env.DEVSPACE_BRIDGE_UPSTREAM || 'http://127.0.0.1:7676');
+const port = Number(process.env.DEVSPACE_BRIDGE_PORT || '7677');
+const localOrigin = `http://127.0.0.1:${port}`;
+const resource = new URL('/mcp', upstream).toString();
+let client, oauth, accessToken = '', refreshToken = '', expiry = 0;
+let challengeState, codeVerifier;
+const log = (msg) => process.stdout.write(`${msg}\n`);
+function localEndpoint(raw) {
+  const value = new URL(raw, upstream);
+  if (value.origin !== upstream.origin) throw new Error('OAuth metadata advertised an unexpected non-local origin');
+  return value.toString();
+}
+async function jsonRequest(url, options) {
+  const r = await fetch(url, { ...options, redirect: 'manual', signal: AbortSignal.timeout(10000) });
+  const raw = await r.text();
+  if (!r.ok) throw new Error(`OAuth HTTP ${r.status} at ${new URL(url).pathname}`);
+  try { return JSON.parse(raw); } catch { throw new Error('OAuth endpoint returned invalid JSON'); }
+}
+async function initializeOAuth() {
+  let meta;
+  for (const path of ['/.well-known/oauth-authorization-server', '/.well-known/oauth-authorization-server/mcp']) {
+    const r = await fetch(new URL(path, upstream), { redirect: 'manual', signal: AbortSignal.timeout(10000) });
+    if (r.status === 404) continue;
+    if (!r.ok) throw new Error(`OAuth discovery failed: ${r.status}`);
+    meta = await r.json();
+    break;
+  }
+  if (!meta) throw new Error('DevSpace OAuth authorization-server metadata is missing');
+  oauth = {
+    authorization_endpoint: localEndpoint(meta.authorization_endpoint),
+    registration_endpoint: localEndpoint(meta.registration_endpoint || '/register'),
+    token_endpoint: localEndpoint(meta.token_endpoint),
+  };
+  client = await jsonRequest(oauth.registration_endpoint, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ client_name: 'DevSpace private tunnel launcher',
+      redirect_uris: [`${localOrigin}/callback`], response_types: ['code'],
+      grant_types: ['authorization_code', 'refresh_token'],
+      token_endpoint_auth_method: 'none', application_type: 'native' }),
+  });
+  if (!client.client_id) throw new Error('OAuth DCR returned no client_id');
+  codeVerifier = randomBytes(48).toString('base64url');
+  challengeState = randomBytes(24).toString('hex');
+  const url = new URL(oauth.authorization_endpoint);
+  for (const [k, v] of Object.entries({ response_type: 'code', client_id: client.client_id,
+    redirect_uri: `${localOrigin}/callback`, code_challenge: createHash('sha256').update(codeVerifier).digest('base64url'),
+    code_challenge_method: 'S256', state: challengeState, scope: 'devspace', resource })) url.searchParams.set(k, v);
+  log(`AUTH_URL=${url}`);
+}
+async function exchange(fields) {
+  if (client.client_secret) fields.client_secret = client.client_secret;
+  fields.client_id = client.client_id;
+  const data = await jsonRequest(oauth.token_endpoint, {
+    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams(fields),
+  });
+  if (!data.access_token) throw new Error('OAuth token response contains no access_token');
+  accessToken = data.access_token;
+  if (data.refresh_token) refreshToken = data.refresh_token;
+  expiry = Date.now() + Math.max(60, Number(data.expires_in || 3600)) * 1000;
+}
+let refreshing;
+async function ensureToken() {
+  if (accessToken && Date.now() < expiry - 60000) return;
+  if (!refreshToken) throw new Error('OAuth token unavailable; restart launcher and authorize');
+  if (!refreshing) refreshing = exchange({ grant_type: 'refresh_token', refresh_token: refreshToken,
+    resource }).finally(() => { refreshing = undefined; });
+  await refreshing;
+}
+function send(res, status, text, type = 'text/plain; charset=utf-8') {
+  res.writeHead(status, { 'content-type': type, 'cache-control': 'no-store' });
+  res.end(text);
+}
+async function onRequest(req, res) {
+  let path;
+  try { path = new URL(req.url, localOrigin); } catch { send(res, 400, 'Bad request'); return; }
+  if (path.pathname === '/healthz') { send(res, 200, 'alive'); return; }
+  if (path.pathname === '/readyz') { send(res, accessToken ? 200 : 503, accessToken ? 'ready' : 'awaiting OAuth'); return; }
+  if (path.pathname === '/callback') {
+    if (!challengeState || path.searchParams.get('state') !== challengeState || !path.searchParams.get('code')) {
+      send(res, 400, 'Invalid authorization state/code'); return;
+    }
+    // One-shot authorization code: reject callbacks replayed with the same state.
+    const code = path.searchParams.get('code');
+    challengeState = '';
+    try {
+      await exchange({ grant_type: 'authorization_code', code, redirect_uri: `${localOrigin}/callback`,
+        code_verifier: codeVerifier, resource });
+      codeVerifier = '';
+      send(res, 200, '<h3>DevSpace: OAuth authorized</h3><p>You can close this tab.</p>', 'text/html; charset=utf-8');
+      log('AUTH_OK');
+    } catch (e) { send(res, 502, 'OAuth token exchange failed; check launcher logs'); log(`ERROR=${e.message}`); }
+    return;
+  }
+  if (path.pathname !== '/mcp' || path.search) { send(res, 404, 'Not Found'); return; }
+  if (!accessToken) { send(res, 503, 'DevSpace authorization not completed'); return; }
+  try { await ensureToken(); }
+  catch (e) { log(`ERROR=${e.message}`); send(res, 503, 'DevSpace OAuth refresh failed'); return; }
+  const headers = { ...req.headers, host: upstream.host, authorization: `Bearer ${accessToken}` };
+  for (const k of Object.keys(headers)) {
+    if (/^(connection|proxy-connection|keep-alive|te|trailer|transfer-encoding|upgrade|forwarded|x-forwarded-.*|proxy-authorization)$/i.test(k)) delete headers[k];
+  }
+  const target = new URL('/mcp', upstream);
+  const proxy = http.request(target, { method: req.method, headers, timeout: 110000 }, (r) => {
+    const reply = { ...r.headers };
+    for (const h of ['connection', 'transfer-encoding', 'keep-alive']) delete reply[h];
+    res.writeHead(r.statusCode || 502, reply);
+    r.pipe(res);
+  });
+  proxy.on('timeout', () => proxy.destroy(new Error('upstream timeout')));
+  proxy.on('error', (e) => { log(`ERROR=upstream proxy: ${e.message}`); if (!res.headersSent) send(res, 502, 'DevSpace unreachable'); else res.destroy(); });
+  req.pipe(proxy);
+}
+async function main() {
+  if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('Invalid bridge port');
+  const server = http.createServer((req, res) => { onRequest(req, res).catch((e) => { log(`ERROR=${e.message}`); if (!res.headersSent) send(res, 500, 'Internal proxy error'); else res.destroy(); }); });
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, '127.0.0.1', resolve); });
+  log(`BRIDGE_LISTENING=${localOrigin}`);
+  await initializeOAuth();
+}
+main().catch((e) => { log(`ERROR=${e.message}`); process.exitCode = 1; });
+'@
+    [IO.File]::WriteAllText($file, $js, (New-Object Text.UTF8Encoding($false)))
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $script:BridgeStdOut = Join-Path $LogDir "devspace-bridge-$stamp.stdout.log"
+    $script:BridgeStdErr = Join-Path $LogDir "devspace-bridge-$stamp.stderr.log"
+    $node = Get-CommandPath -Name 'node.exe'
+    if (-not $node) { throw 'Node.js не найден для OAuth моста.' }
+    $oldPort = [Environment]::GetEnvironmentVariable('DEVSPACE_BRIDGE_PORT','Process')
+    $oldUrl = [Environment]::GetEnvironmentVariable('DEVSPACE_BRIDGE_UPSTREAM','Process')
+    try {
+        [Environment]::SetEnvironmentVariable('DEVSPACE_BRIDGE_PORT', [string]$script:BridgePort,'Process')
+        [Environment]::SetEnvironmentVariable('DEVSPACE_BRIDGE_UPSTREAM', "http://127.0.0.1:$Port",'Process')
+        $script:BridgeProcess = Start-Process -FilePath $node -ArgumentList ('"' + $file + '"') -PassThru -WindowStyle Hidden -RedirectStandardOutput $script:BridgeStdOut -RedirectStandardError $script:BridgeStdErr
+        Register-ManagedProcess -Process $script:BridgeProcess -Name 'DevSpace OAuth bridge'
+        Save-RuntimeState
     } finally {
+        [Environment]::SetEnvironmentVariable('DEVSPACE_BRIDGE_PORT', $oldPort,'Process')
+        [Environment]::SetEnvironmentVariable('DEVSPACE_BRIDGE_UPSTREAM', $oldUrl,'Process')
+    }
+    $authUrl = ''
+    $opened = $false
+    for ($i = 0; $i -lt 180; $i++) {
+        if ($script:BridgeProcess.HasExited) {
+            Show-SecureTunnelLogs
+            $tail = @(Get-Content -LiteralPath $script:BridgeStdOut -Tail 12 -ErrorAction SilentlyContinue) -join '; '
+            throw "Локальный OAuth мост завершился. $tail"
+        }
+        if (Test-LocalReady -Url ("http://127.0.0.1:{0}/readyz" -f $script:BridgePort)) {
+            Write-Ok 'Авторизация DevSpace подтверждена; OAuth bearer в памяти моста.'
+            return
+        }
+        if (Test-Path -LiteralPath $script:BridgeStdOut) {
+            $lines = @(Get-Content -LiteralPath $script:BridgeStdOut -Tail 8 -ErrorAction SilentlyContinue)
+            $authLine = @($lines | Where-Object { $_ -match '^AUTH_URL=' }) | Select-Object -Last 1
+            if (-not $opened -and $authLine) {
+                $authUrl = ([string]$authLine).Substring('AUTH_URL='.Length)
+                $opened = $true
+                Stop-Log
+                try {
+                    Write-Host 'Для авторизации понадобится Owner Password DevSpace.' -ForegroundColor Yellow
+                    Show-DevSpaceOwnerPassword
+                    Write-Host "Авторизация: $authUrl" -ForegroundColor Cyan
+                    try { Start-Process -FilePath $authUrl -ErrorAction Stop | Out-Null }
+                    catch { Write-Warn 'Не удалось открыть браузер автоматически; откройте ссылку выше вручную.' }
+                } finally { Start-Log -Append }
+            }
+            $errors = @($lines | Where-Object { $_ -match '^ERROR=' })
+            if ($errors.Count -gt 0) { throw ("OAuth bridge: {0}" -f $errors[-1]) }
+        }
+        Start-Sleep -Seconds 1
+    }
+    throw 'Авторизация DevSpace не завершена за 180 секунд. Запуск остановлен.'
+}
+
+function Start-SecureTunnel {
+    param([Parameter(Mandatory=$true)][string]$TunnelId)
+    Write-Step 'OpenAI Secure MCP Tunnel: подключение'
+    $bridgeUrl = 'http://127.0.0.1:{0}/mcp' -f $script:BridgePort
+    $health = 'http://127.0.0.1:{0}/readyz' -f $script:HealthPort
+    if (-not $script:RuntimeKey) { throw 'Runtime API key отсутствует.' }
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $script:TunnelStdOut = Join-Path $LogDir "devspace-tunnel-$stamp.stdout.log"
+    $script:TunnelStdErr = Join-Path $LogDir "devspace-tunnel-$stamp.stderr.log"
+    $oldKey = [Environment]::GetEnvironmentVariable('CONTROL_PLANE_API_KEY','Process')
+    try {
+        [Environment]::SetEnvironmentVariable('CONTROL_PLANE_API_KEY', $script:RuntimeKey,'Process')
+        $args = @('run','--control-plane.tunnel-id',$TunnelId,'--mcp.server-url',$bridgeUrl,
+            '--health.listen-addr',("127.0.0.1:{0}" -f $script:HealthPort))
+        $script:TunnelProcess = Start-Process -FilePath $script:TunnelExe -ArgumentList $args -PassThru -WindowStyle Hidden -RedirectStandardOutput $script:TunnelStdOut -RedirectStandardError $script:TunnelStdErr
+        Register-ManagedProcess -Process $script:TunnelProcess -Name 'DevSpace Secure Tunnel'
+        Save-RuntimeState
+    } finally {
+        [Environment]::SetEnvironmentVariable('CONTROL_PLANE_API_KEY', $oldKey,'Process')
+        $script:RuntimeKey = $null
+    }
+    for ($i = 0; $i -lt 45; $i++) {
+        if ($script:TunnelProcess.HasExited) {
+            Show-SecureTunnelLogs
+            throw "tunnel-client завершился (exit $($script:TunnelProcess.ExitCode))."
+        }
+        if (Test-LocalReady -Url $health) {
+            Write-Ok "Secure MCP Tunnel готов и опрашивает OpenAI: $TunnelId"
+            return
+        }
+        Start-Sleep -Seconds 1
+    }
+    Show-SecureTunnelLogs
+    throw 'tunnel-client запущен, но /readyz не стал готовым за 45 секунд.'
+}
+
+function Stop-SecureTunnel {
+    try {
+        if ($script:TunnelProcess -and -not $script:TunnelProcess.HasExited) {
+            [void](Stop-ProcessTreeTargeted -ProcessId ([int]$script:TunnelProcess.Id) -Label 'DevSpace Secure Tunnel' -Quiet)
+        }
+        if ($script:BridgeProcess -and -not $script:BridgeProcess.HasExited) {
+            [void](Stop-ProcessTreeTargeted -ProcessId ([int]$script:BridgeProcess.Id) -Label 'DevSpace OAuth bridge' -Quiet)
+        }
+    } finally {
+        $script:TunnelProcess = $null
+        $script:BridgeProcess = $null
+        Save-RuntimeState
+        if (-not $script:TunnelProcess -and -not $script:BridgeProcess -and -not $script:DevSpaceProcess -and -not $script:DevSpaceWatchdogProcess) { Clear-RuntimeState }
+    }
+}
+
+function Start-DevSpaceSession {
+    param([string]$Winget, $Settings)
+    try {
+        # No public OAuth issuer: DevSpace OAuth is completed locally by the bridge.
+        Set-DevSpacePublicUrl -PublicOrigin ("http://127.0.0.1:{0}" -f $Port)
+        if (-not (Test-DevSpaceAllowedRootsConfigured)) {
+            throw 'Project Roots не настроены; запуск DevSpace остановлен.'
+        }
+        Write-Step 'Диагностика DevSpace'
+        $doctorOk = Invoke-DevSpaceDoctor
+        if (-not $doctorOk) { throw 'DevSpace doctor сообщил ошибку. Исправьте её перед запуском.' }
+        Start-DevSpaceServerBackground
+        Start-DevSpaceOAuthBridge
+        Start-SecureTunnel -TunnelId $Settings.TunnelId
+        Show-ConnectionCard -TunnelId $Settings.TunnelId
+        return (Show-RunningServerMenu -TunnelId $Settings.TunnelId)
+    } finally {
+        Stop-SecureTunnel
         Stop-DevSpaceServerBackground
-        Stop-NgrokTunnelBackground
     }
 }
 
@@ -3218,25 +3415,23 @@ function Show-MainMenu {
     param($Settings)
     while ($true) {
         Write-Rule 'DEVSPACE MCP — ГЛАВНОЕ МЕНЮ'
-        Write-Host '  [1] Запустить MCP сервер и дать ChatGPT доступ к папке  <- основной путь' -ForegroundColor Green
-        Write-Host '      Папка → режим ngrok → Dev Domain → Authtoken → запуск' -ForegroundColor Green
-        Write-Host ''
-        Write-Host '  [2] Штатные настройки DevSpace (ChatGPT / Coding Agents / агенты)' -ForegroundColor White
+        Write-Host '  [1] Запустить DevSpace через OpenAI Secure MCP Tunnel' -ForegroundColor Green
+        Write-Host '      Папки → ключи из .env → ID туннеля → OAuth → запуск' -ForegroundColor Gray
+        Write-Host '  [2] Штатные настройки DevSpace' -ForegroundColor White
         Write-Host '  [3] Диагностика DevSpace' -ForegroundColor White
         Write-Host '  [0] Выход' -ForegroundColor DarkGray
-        Write-Host ''
-        Write-Host 'В любом шаге основного мастера: B — назад в это меню.' -ForegroundColor DarkGray
         $choice = (Read-Host 'Выбор [1]').Trim()
         if (-not $choice) { $choice = '1' }
         switch ($choice) {
             '1' {
-                $launch = Configure-LaunchWizard -Settings $Settings
-                if ($launch) { return [pscustomobject]@{ Action='start'; Mode=$launch.Mode } }
+                if (Configure-LaunchWizard -Settings $Settings) {
+                    return [pscustomobject]@{ Action='start' }
+                }
             }
             '2' { Open-DevSpaceNativeSettings }
             '3' { Run-DiagnosticsOnly }
-            '0' { return [pscustomobject]@{ Action='exit'; Mode=$null } }
-            default { Write-Warn 'Неизвестный пункт меню.' }
+            '0' { return [pscustomobject]@{ Action='exit' } }
+            default { Write-Warn 'Выберите 1, 2, 3 или 0.' }
         }
     }
 }
@@ -3282,62 +3477,41 @@ function Show-RecoverableError {
 Start-Log
 try {
     Clear-Host
-    Write-Rule ("DEVSPACE MCP — АВТОУСТАНОВКА И ЗАПУСК v{0}" -f $ScriptVersion)
-    Write-Host 'Скрипт проверяет компоненты и устанавливает только отсутствующие/несовместимые.' -ForegroundColor Gray
-    Write-Host 'Системный вывод установщиков показывается в реальном времени; ошибки дополнительно выделяются красным.' -ForegroundColor Gray
-    Write-Host 'ngrok ставится напрямую из официального ZIP; Microsoft Store используется только как резервный вариант.' -ForegroundColor Gray
+    Write-Rule ("DEVSPACE MCP — SECURE TUNNEL v{0}" -f $ScriptVersion)
+    Write-Host 'Локальный DevSpace + OAuth bridge + OpenAI Secure MCP Tunnel.'
+    Write-Host ('.env рядом с CMD: {0}' -f $DotEnvPath) -ForegroundColor DarkGray
     Write-Host ("Журнал: {0}" -f $LogPath) -ForegroundColor DarkGray
-
     Invoke-StartupProcessCleanup
     Prepare-PowerShellPolicy
     $winget = Ensure-Winget
     Ensure-Git -Winget $winget
     $nodeInfo = Ensure-Node -Winget $winget
-    $ngrokInfo = Ensure-Ngrok -Winget $winget
+    Ensure-TunnelClient
     $devspaceVersion = Ensure-DevSpace -NodeInfo $nodeInfo
     Ensure-DevSpaceUtf8ShellPatch -NodeInfo $nodeInfo
-    Show-VersionSummary -Winget $winget -NodeInfo $nodeInfo -NgrokInfo $ngrokInfo -DevSpaceVersion $devspaceVersion
-
+    Show-VersionSummary -Winget $winget -NodeInfo $nodeInfo -DevSpaceVersion $devspaceVersion
     $settings = Load-Settings
     while ($true) {
-        try {
-            $menu = Show-MainMenu -Settings $settings
-        } catch {
-            Show-RecoverableError -ErrorRecord $_ -Context 'главное меню / настройка запуска'
-            continue
-        }
+        try { $menu = Show-MainMenu -Settings $settings }
+        catch { Show-RecoverableError -ErrorRecord $_ -Context 'настройка запуска'; continue }
         if ($menu.Action -eq 'exit') { break }
         try {
-            Start-DevSpaceSession -Winget $winget -Settings $settings -Mode $menu.Mode
+            $outcome = Start-DevSpaceSession -Winget $winget -Settings $settings
+            if ($outcome -eq 'restart') { continue }
         } catch {
-            # Start-DevSpaceSession has its own finally block, so DevSpace/ngrok are
-            # stopped before we return to the menu. Keep the launcher itself alive.
-            Show-RecoverableError -ErrorRecord $_ -Context 'запуск MCP сервера'
+            Show-RecoverableError -ErrorRecord $_ -Context 'запуск Secure MCP Tunnel'
             continue
         }
-        # Start-DevSpaceSession returns here only after [0] stopped DevSpace/ngrok.
-        # Keep the same console window and show the main menu again.
     }
     exit 0
-}
-catch {
+} catch {
     Write-Rule 'ОШИБКА'
     Write-Host $_.Exception.ToString() -ForegroundColor Red
-    if ($_.ScriptStackTrace) {
-        Write-Host ''
-        Write-Host 'PowerShell stack:' -ForegroundColor DarkRed
-        Write-Host $_.ScriptStackTrace -ForegroundColor DarkRed
-    }
-    Write-Host ''
-    Write-Host ("Журнал: {0}" -f $LogPath) -ForegroundColor Yellow
-    Show-NgrokFailureLogs
+    Show-SecureTunnelLogs
     exit 1
-}
-finally {
-    # Final safety net. Normal session cleanup should already have stopped the
-    # watchdog and child processes. Keep both guards here for abnormal paths.
+} finally {
+    try { Stop-SecureTunnel } catch {}
     try { Stop-DevSpaceServerBackground } catch {}
-    try { Stop-NgrokTunnelBackground } catch {}
     try { Stop-DevSpaceWatchdog } catch {}
     try { [DevSpaceMcp.ProcessGuard]::Shutdown() } catch {}
     Stop-Log
