@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/readme-banner.webp" alt="Преврати обычный ChatGPT в мощного агента для ПК — доступ к папкам и проектам Windows" width="100%" />
+  <img src="https://github.com/user-attachments/assets/60c6a486-dbc9-4a06-8caa-66202636a559" alt="Преврати обычный ChatGPT в мощного агента для ПК — доступ к папкам и проектам Windows" width="100%" />
 </p>
 
 # DevSpace MCP Launcher для Windows
