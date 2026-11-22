@@ -20,12 +20,17 @@
 
 1. **[Скачайте `start-devspace-mcp.cmd` из релиза v2.0](https://github.com/portg80/devspace_ngrok_Launcher_Auto_Install/releases/download/v2.0/start-devspace-mcp.cmd)** и сохраните в отдельную папку.
 2. **Запустите файл двойным щелчком.** Скрипт проверит Windows и установит недостающие компоненты. Нужны интернет и Windows 10/11 (64-бит); при необходимости подтвердите запрос Windows на установку.
-3. Выберите **`[1] Запустить DevSpace`** и укажите папки проектов, с которыми сможет работать ChatGPT.
-4. При первом запуске укажите ключи OpenAI. Лаунчер покажет подсказки и сохранит их в файл `.env` рядом с CMD:
+<p align="center"><img width="400" alt="image" src="https://github.com/user-attachments/assets/221f069c-5c2f-4fa5-89ad-bd6240dbd36f" /></p>
+3. Выберите "**[1] Запустить DevSpace**" и укажите папки проектов, с которыми сможет работать ChatGPT.
+<p align="center"><img width="400" alt="image" src="https://github.com/user-attachments/assets/d6bcbfaa-4242-47c6-b74c-9ee999ea15b2" /></p>
+4. При первом запуске следуйте подсказкам которые выводит скрипт, укажите ключи OpenAI, лаунчер сохранит их в файл `.env` рядом со скриптом:
    - **Runtime API key** — [создать ключ](https://platform.openai.com/settings/organization/api-keys) с разрешениями *Tunnels Read + Use*.
    - **Admin API key** — [создать ключ](https://platform.openai.com/settings/organization/admin-keys) с разрешениями *Tunnels Read + Manage*. Нужен для регистрации нового туннеля.
+   <p align="center"><img width="400" alt="image" src="https://github.com/user-attachments/assets/2b63d7f4-3365-4146-b407-ff63d56fda63" /></p>
 5. Если откроется страница авторизации DevSpace, введите **Owner Password**, который покажет окно лаунчера.
 6. В ChatGPT откройте **Настройки → Плагины → Добавить собственный MCP-сервер**. Выберите подключение **Tunnel**, вставьте **Tunnel ID**, показанный лаунчером, и установите **Authentication: No authentication**.
+<p align="center"><img width="1000" alt="image" src="https://github.com/user-attachments/assets/d4c3db48-f5b3-4877-bdca-44b73d1925d8" /></p>
+
 
 После подключения ChatGPT сможет работать с выбранными папками. **Не закрывайте окно CMD, пока используете DevSpace**: при закрытии доступ прекращается.
 
