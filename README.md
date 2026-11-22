@@ -33,6 +33,7 @@
 
 
 После подключения ChatGPT сможет работать с выбранными папками. **Не закрывайте окно CMD, пока используете DevSpace**: при закрытии доступ прекращается.
+<p align="center"><img width="1500" lt="image" src="https://github.com/user-attachments/assets/190e4bd0-70e0-492c-b9b1-243376a00527" /></p>
 
 ## Важно о безопасности
 
